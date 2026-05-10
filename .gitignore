@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pycache-check/
+.pycache-check*/
+.pylance/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Local dev
+.vscode/
+.idea/
+
+# Backend runtime artifacts
+backend/storage/uploads/
+backend/backend/storage/uploads/
+backend/**/storage/uploads/
+
+# Logs / reports
+logs/
+
+# Node / Next.js (monorepo)
+**/node_modules/
+**/.next/
+**/out/
+**/build/
+
+# OS
+.DS_Store
+Thumbs.db
