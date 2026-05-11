@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.schemas.chat import normalize_chart_type
 from app.services.token_budget_service import TokenBudgetService
 
 
@@ -31,11 +32,12 @@ class LlmService:
         self.budget_service = TokenBudgetService()
 
     def available_providers(self) -> list[str]:
+        """Return providers in priority order: Groq (fastest) → Gemini → DeepSeek (slowest)."""
         providers = []
-        if self.settings.gemini_api_key:
-            providers.append("gemini")
         if self.settings.groq_api_key:
             providers.append("groq")
+        if self.settings.gemini_api_key:
+            providers.append("gemini")
         if self.settings.huggingface_api_key:
             providers.append("deepseek")
         return providers
@@ -228,7 +230,8 @@ class LlmService:
             raise ValueError(
                 f"{self._provider_label(preferred)} is selected, but {key_name} is not configured on the backend."
             )
-        return [preferred]
+        # Put preferred first, then add remaining available providers as fallbacks
+        return [preferred] + [p for p in available if p != preferred]
 
     def _normalize_provider(self, provider: str | None) -> str | None:
         normalized = (provider or "").strip().lower()
@@ -239,7 +242,6 @@ class LlmService:
 
     def _rate_limit_message(self, provider: str) -> str:
         return f"Selected LLM provider {self._provider_label(provider)} is currently rate-limited."
-        return available
 
     def _build_model(self, provider: str, max_output_tokens: int):
         timeout = self.settings.llm_timeout_seconds
@@ -249,17 +251,20 @@ class LlmService:
                 google_api_key=self.settings.gemini_api_key,
                 temperature=0.1,
                 timeout=timeout,
-                max_retries=1,
+                max_retries=0,
                 max_output_tokens=max_output_tokens,
             )
         if provider == "deepseek":
+            ds_timeout = self.settings.deepseek_timeout_seconds
+            # Cap output tokens for DeepSeek free tier to conserve budget
+            ds_max_tokens = min(max_output_tokens, 300)
             llm = HuggingFaceEndpoint(
                 repo_id=self.settings.deepseek_model,
                 task="text-generation",
                 huggingfacehub_api_token=self.settings.huggingface_api_key,
-                max_new_tokens=max_output_tokens,
+                max_new_tokens=ds_max_tokens,
                 temperature=0.1,
-                timeout=timeout,
+                timeout=ds_timeout,
                 provider="auto",
             )
             return ChatHuggingFace(llm=llm)
@@ -323,6 +328,9 @@ class LlmService:
         payload: dict,
         schema: type[BaseModel] | dict[str, Any] | None,
     ) -> dict:
+        # Normalize chart_type before Pydantic validation to avoid literal errors
+        if "chart_type" in payload:
+            payload["chart_type"] = normalize_chart_type(payload["chart_type"])
         if isinstance(schema, type) and issubclass(schema, BaseModel):
             return schema.model_validate(payload).model_dump()
         return payload

@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import time
 
 from app.core.config import get_settings
@@ -10,6 +10,13 @@ from app.core.config import get_settings
 class BudgetSnapshot:
     requests_per_minute: int
     tokens_per_minute: int
+    requests_per_day: int = 0  # 0 means no daily limit
+
+
+@dataclass(slots=True)
+class DailyCounter:
+    day: int = 0  # ordinal day number
+    count: int = 0
 
 
 class TokenBudgetService:
@@ -19,6 +26,7 @@ class TokenBudgetService:
             "gemini": BudgetSnapshot(
                 requests_per_minute=settings.gemini_requests_per_minute,
                 tokens_per_minute=settings.gemini_tokens_per_minute,
+                requests_per_day=1400,  # Gemini free tier: 1500/day, keep 100 buffer
             ),
             "groq": BudgetSnapshot(
                 requests_per_minute=settings.groq_requests_per_minute,
@@ -31,6 +39,7 @@ class TokenBudgetService:
         }
         self.request_windows: dict[str, deque[float]] = defaultdict(deque)
         self.token_windows: dict[str, deque[tuple[float, int]]] = defaultdict(deque)
+        self.daily_counters: dict[str, DailyCounter] = defaultdict(DailyCounter)
         self.lock = asyncio.Lock()
 
     @staticmethod
@@ -48,6 +57,12 @@ class TokenBudgetService:
                 return False
             if current_tokens + estimated_tokens > budget.tokens_per_minute:
                 return False
+            # Check daily limit if configured
+            if budget.requests_per_day > 0:
+                daily = self._get_daily(provider, now)
+                if daily.count + 1 > budget.requests_per_day:
+                    return False
+                daily.count += 1
             self.request_windows[provider].append(now)
             self.token_windows[provider].append((now, estimated_tokens))
             return True
@@ -59,7 +74,25 @@ class TokenBudgetService:
             budget = self.budgets[provider]
             current_requests = len(self.request_windows[provider])
             current_tokens = sum(token_count for _, token_count in self.token_windows[provider])
-            return current_requests + 1 <= budget.requests_per_minute and current_tokens + estimated_tokens <= budget.tokens_per_minute
+            if current_requests + 1 > budget.requests_per_minute:
+                return False
+            if current_tokens + estimated_tokens > budget.tokens_per_minute:
+                return False
+            if budget.requests_per_day > 0:
+                daily = self._get_daily(provider, now)
+                if daily.count + 1 > budget.requests_per_day:
+                    return False
+            return True
+
+    def _get_daily(self, provider: str, now: float) -> DailyCounter:
+        """Get or reset the daily counter for a provider."""
+        import datetime
+        today = datetime.date.today().toordinal()
+        counter = self.daily_counters[provider]
+        if counter.day != today:
+            counter.day = today
+            counter.count = 0
+        return counter
 
     def _cleanup(self, provider: str, now: float) -> None:
         request_window = self.request_windows[provider]

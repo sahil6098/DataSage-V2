@@ -594,7 +594,7 @@ class ChatService:
                     profile=profile,
                 ),
                 preferred_provider=provider_preference,
-                max_output_tokens=900,
+                max_output_tokens=500,
             ):
                 if not provider_used:
                     provider_used = provider
@@ -643,7 +643,7 @@ class ChatService:
                     profile=profile,
                 ),
                 preferred_provider=provider_preference,
-                max_output_tokens=900,
+                max_output_tokens=500,
             )
         except ValueError:
             return f"{schema_reply.rstrip()}\n\n{self._fallback_profile_analysis(profile)}".strip(), None
@@ -860,7 +860,7 @@ class ChatService:
                 user_prompt=user_prompt,
                 preferred_provider=state.get("provider_preference"),
                 schema=MongoAnalysisPlan if source_type == "mongodb" else SqlAnalysisPlan,
-                max_output_tokens=500,
+                max_output_tokens=350,
             )
         except ValueError as exc:
             if self._is_structured_output_error(exc):
