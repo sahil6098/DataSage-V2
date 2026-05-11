@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from pydantic import BaseModel
 
 from app.core.config import get_settings
@@ -16,10 +17,11 @@ from app.services.token_budget_service import TokenBudgetService
 
 logger = get_logger(__name__)
 
-SUPPORTED_PROVIDERS = {"gemini", "groq"}
+SUPPORTED_PROVIDERS = {"gemini", "groq", "deepseek"}
 PROVIDER_LABELS = {
     "gemini": "Gemini",
     "groq": "Groq",
+    "deepseek": "DeepSeek",
 }
 
 
@@ -34,6 +36,8 @@ class LlmService:
             providers.append("gemini")
         if self.settings.groq_api_key:
             providers.append("groq")
+        if self.settings.huggingface_api_key:
+            providers.append("deepseek")
         return providers
 
     def ensure_user_message_limit(self, message: str) -> None:
@@ -50,12 +54,12 @@ class LlmService:
         user_prompt: str,
         preferred_provider: str | None = None,
         schema: type[BaseModel] | dict[str, Any] | None = None,
-        max_output_tokens: int = 900,
+        max_output_tokens: int = 500,
     ) -> tuple[dict, str]:
         selected_provider = self._normalize_provider(preferred_provider)
         providers = self._provider_order(preferred_provider)
         if not providers:
-            raise ValueError("No LLM provider is configured. Add a Gemini or Groq API key.")
+            raise ValueError("No LLM provider is configured. Add a Gemini, Groq, or HuggingFace API key.")
 
         last_error: Exception | None = None
         estimated_tokens = (
@@ -123,12 +127,12 @@ class LlmService:
         system_prompt: str,
         user_prompt: str,
         preferred_provider: str | None = None,
-        max_output_tokens: int = 900,
+        max_output_tokens: int = 500,
     ) -> tuple[str, str]:
         selected_provider = self._normalize_provider(preferred_provider)
         providers = self._provider_order(preferred_provider)
         if not providers:
-            raise ValueError("No LLM provider is configured. Add a Gemini or Groq API key.")
+            raise ValueError("No LLM provider is configured. Add a Gemini, Groq, or HuggingFace API key.")
 
         last_error: Exception | None = None
         estimated_tokens = (
@@ -166,12 +170,12 @@ class LlmService:
         system_prompt: str,
         user_prompt: str,
         preferred_provider: str | None = None,
-        max_output_tokens: int = 900,
+        max_output_tokens: int = 500,
     ) -> AsyncIterator[tuple[str, str]]:
         selected_provider = self._normalize_provider(preferred_provider)
         providers = self._provider_order(preferred_provider)
         if not providers:
-            raise ValueError("No LLM provider is configured. Add a Gemini or Groq API key.")
+            raise ValueError("No LLM provider is configured. Add a Gemini, Groq, or HuggingFace API key.")
 
         last_error: Exception | None = None
         estimated_tokens = (
@@ -219,7 +223,8 @@ class LlmService:
             supported = ", ".join(sorted(self._provider_label(provider) for provider in SUPPORTED_PROVIDERS))
             raise ValueError(f"Unsupported LLM provider '{preferred_provider}'. Choose one of: {supported}.")
         if preferred not in available:
-            key_name = "GEMINI_API_KEY" if preferred == "gemini" else "GROQ_API_KEY"
+            key_names = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "deepseek": "HUGGINGFACE_API_KEY"}
+            key_name = key_names.get(preferred, f"{preferred.upper()}_API_KEY")
             raise ValueError(
                 f"{self._provider_label(preferred)} is selected, but {key_name} is not configured on the backend."
             )
@@ -247,6 +252,17 @@ class LlmService:
                 max_retries=1,
                 max_output_tokens=max_output_tokens,
             )
+        if provider == "deepseek":
+            llm = HuggingFaceEndpoint(
+                repo_id=self.settings.deepseek_model,
+                task="text-generation",
+                huggingfacehub_api_token=self.settings.huggingface_api_key,
+                max_new_tokens=max_output_tokens,
+                temperature=0.1,
+                timeout=timeout,
+                provider="auto",
+            )
+            return ChatHuggingFace(llm=llm)
         return ChatGroq(
             model_name=self.settings.groq_model,
             groq_api_key=self.settings.groq_api_key,

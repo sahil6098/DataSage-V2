@@ -18,3 +18,4 @@ langgraph==0.6.6
 langchain-core==0.3.75
 langchain-google-genai==2.1.12
 langchain-groq==0.3.8
+langchain-huggingface>=0.1.2

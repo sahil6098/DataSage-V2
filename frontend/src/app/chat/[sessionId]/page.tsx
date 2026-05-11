@@ -19,7 +19,7 @@ const API = API_BASE_PATH;
 const MODEL_STORAGE_KEY = "llm_provider";
 const STREAM_FRAME_MS = 16;
 
-type LlmProvider = "groq" | "gemini";
+type LlmProvider = "groq" | "gemini" | "deepseek";
 
 interface Message {
   role: string;
@@ -73,7 +73,9 @@ function isConnectorErrorMessage(message: string | null | undefined) {
 }
 
 function formatProviderLabel(provider: LlmProvider) {
-  return provider === "gemini" ? "Gemini" : "Groq";
+  if (provider === "gemini") return "Gemini";
+  if (provider === "deepseek") return "DeepSeek";
+  return "Groq";
 }
 
 function formatSourceTitle(sourceConfig: ConnectedSourceConfig | null) {
@@ -135,7 +137,7 @@ export default function ChatSessionPage() {
 
   useEffect(() => {
     const savedProvider = typeof window !== "undefined" ? window.localStorage.getItem(MODEL_STORAGE_KEY) : null;
-    if (savedProvider === "groq" || savedProvider === "gemini") {
+    if (savedProvider === "groq" || savedProvider === "gemini" || savedProvider === "deepseek") {
       setLlmProvider(savedProvider);
     }
   }, []);
@@ -662,28 +664,32 @@ null
 
                       <div className="composer-footer">
                         <div className="composer-actions">
-                          <button
-                            type="button"
-                            className="action-chip cursor-database"
-                            onClick={() => { setConnectorModalMode("database"); setIsModalOpen(true); }}
-                          >
-                            <span className="action-chip-glow" />
-                            <span className="action-chip-icon">
-                              <Database size={14} />
-                            </span>
-                            <span className="action-chip-copy">Connect data</span>
-                          </button>
-                          <button
-                            type="button"
-                            className="action-chip cursor-upload"
-                            onClick={() => { setConnectorModalMode("file"); setIsModalOpen(true); }}
-                          >
-                            <span className="action-chip-glow" />
-                            <span className="action-chip-icon">
-                              <UploadCloud size={14} />
-                            </span>
-                            <span className="action-chip-copy">Upload file</span>
-                          </button>
+                          {!sourceConfigured && (
+                            <>
+                              <button
+                                type="button"
+                                className="action-chip cursor-database"
+                                onClick={() => { setConnectorModalMode("database"); setIsModalOpen(true); }}
+                              >
+                                <span className="action-chip-glow" />
+                                <span className="action-chip-icon">
+                                  <Database size={14} />
+                                </span>
+                                <span className="action-chip-copy">Connect data</span>
+                              </button>
+                              <button
+                                type="button"
+                                className="action-chip cursor-upload"
+                                onClick={() => { setConnectorModalMode("file"); setIsModalOpen(true); }}
+                              >
+                                <span className="action-chip-glow" />
+                                <span className="action-chip-icon">
+                                  <UploadCloud size={14} />
+                                </span>
+                                <span className="action-chip-copy">Upload file</span>
+                              </button>
+                            </>
+                          )}
                           {sourceConfigured ? (
                             <button
                               type="button"
@@ -726,8 +732,13 @@ null
                             </button>
 
                             <div className={`provider-menu ${modelMenuOpen ? "open" : ""}`} role="menu" aria-label="Select model">
-                              {(["gemini", "groq"] as LlmProvider[]).map((provider) => {
+                              {(["gemini", "groq", "deepseek"] as LlmProvider[]).map((provider) => {
                                 const active = provider === llmProvider;
+                                const subtitle = provider === "gemini"
+                                  ? "Balanced multimodal analysis"
+                                  : provider === "deepseek"
+                                    ? "DeepSeek V4 via HuggingFace"
+                                    : "Fast structured reasoning";
                                 return (
                                   <button
                                     key={provider}
@@ -744,7 +755,7 @@ null
                                       <span className="provider-option-copy">
                                         <span className="provider-option-title">{formatProviderLabel(provider)}</span>
                                         <span className="provider-option-subtitle">
-                                          {provider === "gemini" ? "Balanced multimodal analysis" : "Fast structured reasoning"}
+                                          {subtitle}
                                         </span>
                                       </span>
                                     </span>
@@ -754,9 +765,11 @@ null
                               })}
                             </div>
                           </div>
-                          <span className={`message-budget-pill ${messageBudget.overLimit ? "over-limit" : ""}`}>
-                            Message budget {messageBudget.estimatedTokens}/{MAX_MESSAGE_TOKENS} tokens
-                          </span>
+                          {!sourceConfigured && (
+                            <span className={`message-budget-pill ${messageBudget.overLimit ? "over-limit" : ""}`}>
+                              Message budget {messageBudget.estimatedTokens}/{MAX_MESSAGE_TOKENS} tokens
+                            </span>
+                          )}
                         </div>
 
                         <button

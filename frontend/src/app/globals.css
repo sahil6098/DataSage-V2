@@ -359,6 +359,7 @@ button {
 .sidebar-panel .brand-row {
   background: transparent !important;
   border-color: transparent !important;
+  border-radius: 0 !important;
   padding: 8px 12px;
   font-size: 1.35rem;
   letter-spacing: -0.02em;
@@ -692,7 +693,7 @@ button {
   top: 0;
   left: 0;
   padding: 24px 18px;
-  border-radius: 0 28px 28px 0;
+  border-radius: 0;
   border-left: none;
   display: flex;
   flex-direction: column;
@@ -735,7 +736,7 @@ button {
   align-items: center;
   gap: 12px;
   padding: 14px 14px 14px 18px;
-  border-radius: 18px;
+  border-radius: 0;
   border: 1px solid transparent;
   border-left: 3px solid transparent;
   color: var(--text-muted);
@@ -773,20 +774,20 @@ button {
   display: flex;
   align-items: stretch;
   gap: 0;
-  border-radius: 18px;
+  border-radius: 0;
   overflow: hidden;
 }
 
 .session-item-wrap .session-link {
   flex: 1;
   min-width: 0;
-  border-radius: 18px 0 0 18px;
+  border-radius: 0;
   border-right: none;
 }
 
 .session-item-wrap:has(.session-delete-btn:focus-visible) .session-link,
 .session-item-wrap:hover .session-link {
-  border-radius: 18px 0 0 18px;
+  border-radius: 0;
 }
 
 .session-chevron {
@@ -809,7 +810,7 @@ button {
   padding: 0;
   border: 1px solid transparent;
   border-left: none;
-  border-radius: 0 18px 18px 0;
+  border-radius: 0;
   background: transparent;
   color: var(--text-faint);
   overflow: hidden;
@@ -853,7 +854,7 @@ button {
   align-items: center;
   gap: 12px;
   padding: 14px;
-  border-radius: 20px;
+  border-radius: 0;
   background: rgba(255, 255, 255, 0.68);
   border: 1px solid var(--border-soft);
 }
@@ -862,6 +863,13 @@ button {
 .sidebar-user .message-time {
   display: block;
   overflow-wrap: anywhere;
+}
+
+.sidebar-panel .btn-primary,
+.sidebar-panel .btn-secondary,
+.sidebar-panel .info-banner,
+.sidebar-panel .avatar {
+  border-radius: 0 !important;
 }
 
 .avatar {
@@ -2070,6 +2078,11 @@ button {
 .provider-option-icon.groq {
   background: linear-gradient(135deg, #2563eb, #1d4ed8);
   box-shadow: 0 12px 22px rgba(37, 99, 235, 0.22);
+}
+
+.provider-option-icon.deepseek {
+  background: linear-gradient(135deg, #6366f1, #4f46e5);
+  box-shadow: 0 12px 22px rgba(99, 102, 241, 0.22);
 }
 
 .provider-option-copy {

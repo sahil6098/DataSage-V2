@@ -132,7 +132,7 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
                     className={`session-link ${active ? "active" : ""}`}
                     onClick={() => onClose?.()}
                   >
-                    <span className="avatar" style={{ width: 38, height: 38, borderRadius: 12 }}>
+                    <span className="avatar" style={{ width: 38, height: 38, borderRadius: 0 }}>
                       {String(session.index + 1).padStart(2, "0")}
                     </span>
                     <div style={{ minWidth: 0, flex: 1 }}>

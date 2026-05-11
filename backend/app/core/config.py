@@ -44,12 +44,16 @@ class Settings(BaseSettings):
     gemini_model: str = Field(default="gemini-1.5-flash", alias="GEMINI_MODEL")
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
     groq_model: str = Field(default="llama-3.1-8b-instant", alias="GROQ_MODEL")
+    huggingface_api_key: str | None = Field(default=None, alias="HUGGINGFACE_API_KEY")
+    deepseek_model: str = Field(default="deepseek-ai/DeepSeek-V4-Flash", alias="DEEPSEEK_MODEL")
     llm_timeout_seconds: int = Field(default=45, alias="LLM_TIMEOUT_SECONDS")
 
-    gemini_requests_per_minute: int = Field(default=10, alias="GEMINI_REQUESTS_PER_MINUTE")
-    groq_requests_per_minute: int = Field(default=20, alias="GROQ_REQUESTS_PER_MINUTE")
-    gemini_tokens_per_minute: int = Field(default=200_000, alias="GEMINI_TOKENS_PER_MINUTE")
-    groq_tokens_per_minute: int = Field(default=6_000, alias="GROQ_TOKENS_PER_MINUTE")
+    gemini_requests_per_minute: int = Field(default=8, alias="GEMINI_REQUESTS_PER_MINUTE")
+    groq_requests_per_minute: int = Field(default=14, alias="GROQ_REQUESTS_PER_MINUTE")
+    deepseek_requests_per_minute: int = Field(default=10, alias="DEEPSEEK_REQUESTS_PER_MINUTE")
+    gemini_tokens_per_minute: int = Field(default=100_000, alias="GEMINI_TOKENS_PER_MINUTE")
+    groq_tokens_per_minute: int = Field(default=5_000, alias="GROQ_TOKENS_PER_MINUTE")
+    deepseek_tokens_per_minute: int = Field(default=100_000, alias="DEEPSEEK_TOKENS_PER_MINUTE")
 
     @field_validator("cors_origins", mode="before")
     @classmethod

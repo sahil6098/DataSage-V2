@@ -24,6 +24,10 @@ class TokenBudgetService:
                 requests_per_minute=settings.groq_requests_per_minute,
                 tokens_per_minute=settings.groq_tokens_per_minute,
             ),
+            "deepseek": BudgetSnapshot(
+                requests_per_minute=settings.deepseek_requests_per_minute,
+                tokens_per_minute=settings.deepseek_tokens_per_minute,
+            ),
         }
         self.request_windows: dict[str, deque[float]] = defaultdict(deque)
         self.token_windows: dict[str, deque[tuple[float, int]]] = defaultdict(deque)

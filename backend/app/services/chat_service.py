@@ -19,13 +19,13 @@ from app.utils.time import ist_now
 logger = get_logger(__name__)
 
 
-MAX_PROMPT_CHARS = 12_000
+MAX_PROMPT_CHARS = 8_000
 MAX_CONTEXT_TABLES = 8
-MAX_CONTEXT_FIELDS_PER_TABLE = 14
-MAX_CONTEXT_SAMPLE_CHARS = 80
-MAX_PROMPT_ROWS = 12
-MAX_PROMPT_FIELDS_PER_ROW = 14
-MAX_PROMPT_VALUE_CHARS = 320
+MAX_CONTEXT_FIELDS_PER_TABLE = 12
+MAX_CONTEXT_SAMPLE_CHARS = 60
+MAX_PROMPT_ROWS = 10
+MAX_PROMPT_FIELDS_PER_ROW = 12
+MAX_PROMPT_VALUE_CHARS = 200
 MAX_QUERY_RETRIES = 1
 
 SQL_KEYWORDS = {
@@ -209,7 +209,7 @@ class ChatService:
                 sanity_warnings=sanity_warnings,
             ),
             preferred_provider=state.get("provider_used") or state.get("provider_preference"),
-            max_output_tokens=700,
+            max_output_tokens=500,
         ):
             if not state.get("provider_used"):
                 state["provider_used"] = provider
@@ -594,7 +594,7 @@ class ChatService:
                     profile=profile,
                 ),
                 preferred_provider=provider_preference,
-                max_output_tokens=1400,
+                max_output_tokens=900,
             ):
                 if not provider_used:
                     provider_used = provider
@@ -643,7 +643,7 @@ class ChatService:
                     profile=profile,
                 ),
                 preferred_provider=provider_preference,
-                max_output_tokens=1400,
+                max_output_tokens=900,
             )
         except ValueError:
             return f"{schema_reply.rstrip()}\n\n{self._fallback_profile_analysis(profile)}".strip(), None
@@ -652,7 +652,9 @@ class ChatService:
         return f"{schema_reply.rstrip()}\n\n{insight.strip()}".strip(), provider
 
     async def _sample_data_profile(self, data_source: dict) -> list[dict]:
-        samples = await self.connector_service.sample_data_source(data_source, max_tables=3, row_limit=30)
+        selected_count = len(data_source.get("selected_tables", []))
+        table_limit = max(3, min(selected_count, MAX_CONTEXT_TABLES))
+        samples = await self.connector_service.sample_data_source(data_source, max_tables=table_limit, row_limit=20)
         table_rows_by_name = {
             str(table.get("name")): table
             for table in data_source.get("schema_cache", {}).get("tables", [])
@@ -712,8 +714,10 @@ class ChatService:
         return (
             "You are a careful data analyst describing a connected data source. "
             "Use only the schema summary and sampled profile. "
-            "Write a short Key trends and analysis section with concrete numbers, observed ranges, top categories, "
+            "Describe ALL tables/collections present in the data — their purpose, key fields, and relationships. "
+            "Then write a short Key trends and analysis section with concrete numbers, observed ranges, top categories, "
             "and any obvious data quality notes. If the profile is sampled, say trends are sample-based. "
+            "Always refer to items by human-readable names, never by raw IDs. "
             "Do not repeat the full schema and do not invent fields or conclusions."
         )
 
@@ -856,7 +860,7 @@ class ChatService:
                 user_prompt=user_prompt,
                 preferred_provider=state.get("provider_preference"),
                 schema=MongoAnalysisPlan if source_type == "mongodb" else SqlAnalysisPlan,
-                max_output_tokens=700,
+                max_output_tokens=500,
             )
         except ValueError as exc:
             if self._is_structured_output_error(exc):
@@ -942,6 +946,9 @@ class ChatService:
             "You are a careful data analyst. Use only the query result provided. "
             "Return compact JSON with keys: answer, needs_visualization, chart_type, chart_title, summary, query_preview. "
             "Keep answer concise, highlight numbers clearly, and avoid claiming anything not in the rows. "
+            "IMPORTANT: In your answer, always refer to items by their human-readable name, title, or label. "
+            "Never display raw IDs, ObjectIds, UUIDs, or numeric foreign keys to the user. "
+            "If the data has both an ID and a name column, use only the name in your answer text and chart_title. "
             "Choose chart_type from: bar, horizontal_bar, line, donut, 3d_bar, radar, table. "
             "needs_visualization must be true only when a visual would genuinely help."
         )
@@ -957,7 +964,7 @@ class ChatService:
                 user_prompt=user_prompt,
                 preferred_provider=state.get("provider_used") or state.get("provider_preference"),
                 schema=AnalysisAnswerPayload,
-                max_output_tokens=700,
+                max_output_tokens=500,
             )
         except ValueError as exc:
             if self._is_structured_output_error(exc):
@@ -1028,6 +1035,10 @@ class ChatService:
                 "exists in the schema context provided. If you cannot confidently answer the question "
                 "with the available schema, set confidence to 'low' and explain in notes what is missing. "
                 "Set confidence to 'high' when the schema clearly supports the query, 'medium' if some assumptions are made. "
+                "CRITICAL: When grouping by an ID field (like _id, category_id, product_id, user_id, etc.), "
+                "always use $lookup to join with the related collection and $project to include the human-readable "
+                "name/title/label field instead of showing raw IDs. The result rows must contain readable names, not IDs. "
+                "If there is a 'name', 'title', or 'label' field in the same collection, group by that instead of the ID. "
                 "prefer aggregation answers suitable for dashboards and comparisons; "
                 "pipeline must be a valid JSON array of single-key stage objects like "
                 '{"$match": {"field": "value"}}, {"$group": {"_id": "$field", "count": {"$sum": 1}}}; '
@@ -1043,6 +1054,10 @@ class ChatService:
             "exists in the schema context provided. If you cannot confidently answer the question "
             "with the available schema, set confidence to 'low' and explain in notes what is missing. "
             "Set confidence to 'high' when the schema clearly supports the query, 'medium' if some assumptions are made. "
+            "CRITICAL: When the result would show an ID column (like id, category_id, product_id, user_id, etc.), "
+            "always JOIN with the related table and SELECT the human-readable name/title/label column instead. "
+            "The result rows must contain readable names, not numeric or UUID IDs. "
+            "If there is a 'name', 'title', or 'label' column in the same table, select that instead of the ID. "
             "keep results compact and analysis-ready; prefer grouped comparisons for finance questions."
         )
 
@@ -1061,6 +1076,11 @@ class ChatService:
             "You are a careful data analyst. Answer using only the provided query result. "
             "Be concise, natural, and confident without overstating certainty. "
             "Lead with the most important finding, mention concrete numbers, and use short bullets only when it helps clarity. "
+            "IMPORTANT: Always refer to data items by their human-readable name, title, or label. "
+            "Never show raw IDs, ObjectIds, UUIDs, or numeric foreign keys in your answer. "
+            "If the data contains both an ID and a name field, always use the name. "
+            "When the user asks to describe, explain, or summarize connected data, describe ALL tables/collections "
+            "and their relationships, field purposes, and key data patterns. "
             "Do not mention JSON, internal prompts, or implementation details."
         )
 
