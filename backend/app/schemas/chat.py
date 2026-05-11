@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -14,10 +14,14 @@ class ChatRequest(BaseModel):
 ChartType = Literal["bar", "horizontal_bar", "line", "donut", "3d_bar", "radar", "table"]
 
 
+ConfidenceLevel = Literal["high", "medium", "low"]
+
+
 class SqlAnalysisPlan(BaseModel):
     query: str = Field(min_length=1)
     chart_type: ChartType | None = None
     notes: str | None = None
+    confidence: ConfidenceLevel | None = None
 
 
 class MongoAnalysisPlan(BaseModel):
@@ -25,6 +29,7 @@ class MongoAnalysisPlan(BaseModel):
     pipeline: list[dict[str, Any]] = Field(default_factory=list)
     chart_type: ChartType | None = None
     notes: str | None = None
+    confidence: ConfidenceLevel | None = None
 
 
 class AnalysisAnswerPayload(BaseModel):

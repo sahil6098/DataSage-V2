@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import re
 import string
@@ -12,7 +13,10 @@ from app.schemas.chat import AnalysisAnswerPayload, MongoAnalysisPlan, SqlAnalys
 from app.services.connector_service import ConnectorService
 from app.services.llm_service import LlmService
 from app.services.session_service import SessionService
+from app.core.logging import get_logger
 from app.utils.time import ist_now
+
+logger = get_logger(__name__)
 
 
 MAX_PROMPT_CHARS = 12_000
@@ -22,6 +26,21 @@ MAX_CONTEXT_SAMPLE_CHARS = 80
 MAX_PROMPT_ROWS = 12
 MAX_PROMPT_FIELDS_PER_ROW = 14
 MAX_PROMPT_VALUE_CHARS = 320
+MAX_QUERY_RETRIES = 1
+
+SQL_KEYWORDS = {
+    "select", "from", "where", "and", "or", "not", "in", "is", "null",
+    "like", "between", "as", "on", "join", "left", "right", "inner",
+    "outer", "cross", "group", "by", "order", "asc", "desc", "having",
+    "limit", "offset", "union", "all", "distinct", "case", "when",
+    "then", "else", "end", "exists", "count", "sum", "avg", "min",
+    "max", "with", "true", "false", "cast", "coalesce", "nullif",
+    "ilike", "upper", "lower", "trim", "length", "substring",
+    "extract", "date", "timestamp", "interval", "over", "partition",
+    "row_number", "rank", "dense_rank", "lag", "lead",
+    "public", "table", "into", "values", "set", "using", "recursive",
+    "fetch", "first", "next", "rows", "only", "percent", "ties",
+}
 
 
 class AnalysisState(TypedDict, total=False):
@@ -35,6 +54,32 @@ class AnalysisState(TypedDict, total=False):
     query_plan: dict
     result_rows: list[dict]
     answer_payload: dict
+    validation_warnings: list[str]
+    execution_error: str | None
+    retry_count: int
+    low_confidence: bool
+
+
+class QueryPlanCache:
+    """In-memory cache keyed by normalized question + schema hash."""
+
+    def __init__(self, max_size: int = 200) -> None:
+        self._cache: dict[str, dict] = {}
+        self._max_size = max_size
+
+    def _make_key(self, question: str, schema_context: str) -> str:
+        normalized_q = " ".join(question.lower().split())
+        schema_hash = hashlib.md5(schema_context.encode()).hexdigest()[:8]
+        return f"{normalized_q}|{schema_hash}"
+
+    def get(self, question: str, schema_context: str) -> dict | None:
+        return self._cache.get(self._make_key(question, schema_context))
+
+    def put(self, question: str, schema_context: str, plan: dict) -> None:
+        if len(self._cache) >= self._max_size:
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[self._make_key(question, schema_context)] = plan
 
 
 class ChatService:
@@ -42,6 +87,7 @@ class ChatService:
         self.connector_service = ConnectorService()
         self.session_service = SessionService()
         self.llm_service = LlmService()
+        self.query_cache = QueryPlanCache()
         self.graph = self._build_graph()
 
     async def process_message_stream(
@@ -94,24 +140,51 @@ class ChatService:
         if not data_source:
             raise ValueError("No data source connected to this session.")
 
+        schema_context = self._build_schema_context(data_source)
         state: AnalysisState = {
             "user_id": user_id,
             "session_id": session_id,
             "provider_preference": provider_preference,
             "question": question,
             "data_source": data_source,
-            "schema_context": self._build_schema_context(data_source),
+            "schema_context": schema_context,
         }
 
-        yield self._stage_event("planning", "Planning analysis")
-        state.update(await self._plan_query(state))
+        # --- Tier 4: Check query plan cache ---
+        cached_plan = self.query_cache.get(question, schema_context)
+        if cached_plan:
+            logger.info("Cache hit for question in session %s", session_id)
+            state["query_plan"] = cached_plan
+            state["provider_used"] = cached_plan.get("_cached_provider")
+            yield self._stage_event("planning", "Using cached plan")
+        else:
+            yield self._stage_event("planning", "Planning analysis")
+            state.update(await self._plan_query(state))
 
+        # --- Tier 1C: Handle execution errors gracefully ---
         yield self._stage_event("querying", "Inspecting data")
         state.update(await self._execute_query(state))
+
+        execution_error = state.get("execution_error")
+        if execution_error:
+            error_message = self._format_query_error(execution_error, state.get("validation_warnings"))
+            async for event in self._stream_prebuilt_reply(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=error_message,
+            ):
+                yield event
+            return
 
         rows = state.get("result_rows", [])
         if not rows:
             empty_message = "I could not find matching rows for that question in the connected source."
+            if state.get("low_confidence"):
+                empty_message += (
+                    "\n\nNote: the analysis model had low confidence in the generated query. "
+                    "Try rephrasing your question or check that the right tables and columns are selected."
+                )
             async for event in self._stream_prebuilt_reply(
                 user_id=user_id,
                 session_id=session_id,
@@ -120,6 +193,9 @@ class ChatService:
             ):
                 yield event
             return
+
+        # --- Tier 1B: Sanity check results ---
+        sanity_warnings = self._sanity_check_results(question, state["query_plan"], rows)
 
         yield self._stage_event("generating", "Generating insight")
 
@@ -130,6 +206,7 @@ class ChatService:
                 question=question,
                 query_plan=state["query_plan"],
                 rows=rows,
+                sanity_warnings=sanity_warnings,
             ),
             preferred_provider=state.get("provider_used") or state.get("provider_preference"),
             max_output_tokens=700,
@@ -143,12 +220,22 @@ class ChatService:
         if not message:
             message = "I analyzed the connected data, but I could not produce a summary for that result set."
 
+        # Append sanity disclaimer if warnings exist
+        if sanity_warnings:
+            disclaimer = "\n\n⚠️ *Note: " + "; ".join(sanity_warnings) + " Double-check the result if it seems off.*"
+            message += disclaimer
+
         viz_data = self._build_viz_data(
             question=question,
             query_plan=state["query_plan"],
             rows=rows,
             answer=message,
         )
+
+        # --- Tier 4: Cache successful plan ---
+        if not cached_plan and rows:
+            plan_to_cache = {**state["query_plan"], "_cached_provider": state.get("provider_used")}
+            self.query_cache.put(question, schema_context, plan_to_cache)
 
         now = ist_now()
         await self.session_service.append_messages(
@@ -750,8 +837,19 @@ class ChatService:
         source_type = state["data_source"]["type"]
         question = state["question"]
         context = state["schema_context"]
+        retry_count = state.get("retry_count", 0)
         prompt = self._query_planner_prompt(source_type)
         user_prompt = f"Question:\n{question}\n\nSchema context:\n{context}"
+
+        # --- Tier 3A: Inject previous validation errors on retry ---
+        prev_warnings = state.get("validation_warnings", [])
+        if retry_count > 0 and prev_warnings:
+            user_prompt += (
+                "\n\nYour previous query attempt had these problems:\n"
+                + "\n".join(f"- {w}" for w in prev_warnings)
+                + "\nPlease fix these issues and only use fields that exist in the schema."
+            )
+
         try:
             payload, provider = await self.llm_service.invoke_json(
                 system_prompt=prompt,
@@ -767,18 +865,72 @@ class ChatService:
                 ) from exc
             raise
         payload["query_type"] = source_type if source_type == "mongodb" else "sql"
-        return {"query_plan": payload, "provider_used": provider}
+
+        # --- Tier 1A: Validate plan against schema ---
+        warnings = self._validate_query_plan_against_schema(payload, state["data_source"])
+
+        # --- Tier 2A: Check confidence ---
+        low_confidence = payload.get("confidence") == "low"
+        if low_confidence:
+            logger.info("LLM reported low confidence for question: %s", question[:100])
+
+        result: AnalysisState = {
+            "query_plan": payload,
+            "provider_used": provider,
+            "validation_warnings": warnings,
+            "retry_count": retry_count + 1,
+            "low_confidence": low_confidence,
+        }
+
+        # --- Tier 3A: Retry once if validation found issues ---
+        if warnings and retry_count < MAX_QUERY_RETRIES:
+            logger.warning(
+                "Query plan validation found issues (attempt %d): %s",
+                retry_count + 1,
+                "; ".join(warnings),
+            )
+            retry_state: AnalysisState = {**state, **result}
+            return await self._plan_query(retry_state)
+
+        if warnings:
+            logger.warning("Proceeding with validation warnings after max retries: %s", "; ".join(warnings))
+
+        return result
 
     async def _execute_query(self, state: AnalysisState) -> AnalysisState:
-        result = await self.connector_service.execute_analysis_query(state["data_source"], state["query_plan"])
-        return {"result_rows": result["rows"]}
+        try:
+            result = await self.connector_service.execute_analysis_query(state["data_source"], state["query_plan"])
+            return {"result_rows": result["rows"]}
+        except (ValueError, Exception) as exc:
+            error_msg = str(exc)
+            logger.warning("Query execution failed: %s", error_msg)
+            return {"result_rows": [], "execution_error": error_msg}
 
     async def _summarize_result(self, state: AnalysisState) -> AnalysisState:
-        rows = state.get("result_rows", [])
-        if not rows:
+        # --- Tier 1C: Handle execution error from graph path ---
+        execution_error = state.get("execution_error")
+        if execution_error:
             return {
                 "answer_payload": {
-                    "answer": "I could not find matching rows for that question in the connected source.",
+                    "answer": self._format_query_error(execution_error, state.get("validation_warnings")),
+                    "needs_visualization": False,
+                    "chart_type": None,
+                    "chart_title": None,
+                    "summary": "Query execution failed",
+                }
+            }
+
+        rows = state.get("result_rows", [])
+        if not rows:
+            empty_msg = "I could not find matching rows for that question in the connected source."
+            if state.get("low_confidence"):
+                empty_msg += (
+                    "\n\nNote: the analysis model had low confidence in the generated query. "
+                    "Try rephrasing your question or check that the right tables and columns are selected."
+                )
+            return {
+                "answer_payload": {
+                    "answer": empty_msg,
                     "needs_visualization": False,
                     "chart_type": None,
                     "chart_title": None,
@@ -869,9 +1021,13 @@ class ChatService:
         if source_type == "mongodb":
             return (
                 "You write safe MongoDB aggregation queries for analytics. "
-                "Return JSON only. Keys: collection, pipeline, chart_type, notes. "
+                "Return JSON only. Keys: collection, pipeline, chart_type, notes, confidence. "
                 "Rules: only use selected collections and fields from the schema context; "
                 "never use $out or $merge; add $limit only if needed for previews; "
+                "IMPORTANT: Before writing the pipeline, verify every field name you reference "
+                "exists in the schema context provided. If you cannot confidently answer the question "
+                "with the available schema, set confidence to 'low' and explain in notes what is missing. "
+                "Set confidence to 'high' when the schema clearly supports the query, 'medium' if some assumptions are made. "
                 "prefer aggregation answers suitable for dashboards and comparisons; "
                 "pipeline must be a valid JSON array of single-key stage objects like "
                 '{"$match": {"field": "value"}}, {"$group": {"_id": "$field", "count": {"$sum": 1}}}; '
@@ -880,9 +1036,13 @@ class ChatService:
         dialect = "DuckDB SQL" if source_type in {"csv", "excel", "parquet"} else "PostgreSQL SQL"
         return (
             f"You write safe read-only {dialect} for analytics. "
-            "Return JSON only. Keys: query, chart_type, notes. "
+            "Return JSON only. Keys: query, chart_type, notes, confidence. "
             "Rules: only SELECT or WITH queries; never modify data; "
             "quote identifiers when needed; use only tables and columns in schema context; "
+            "IMPORTANT: Before writing the query, verify every column and table name you reference "
+            "exists in the schema context provided. If you cannot confidently answer the question "
+            "with the available schema, set confidence to 'low' and explain in notes what is missing. "
+            "Set confidence to 'high' when the schema clearly supports the query, 'medium' if some assumptions are made. "
             "keep results compact and analysis-ready; prefer grouped comparisons for finance questions."
         )
 
@@ -904,13 +1064,26 @@ class ChatService:
             "Do not mention JSON, internal prompts, or implementation details."
         )
 
-    def _answer_user_prompt(self, *, question: str, query_plan: dict, rows: list[dict]) -> str:
+    def _answer_user_prompt(
+        self,
+        *,
+        question: str,
+        query_plan: dict,
+        rows: list[dict],
+        sanity_warnings: list[str] | None = None,
+    ) -> str:
         limited_rows = self._compact_prompt_rows(rows)
-        return (
+        prompt = (
             f"User question:\n{question}\n\n"
             f"Executed query plan:\n{self._json_for_prompt(query_plan)}\n\n"
             f"Rows:\n{self._json_for_prompt(limited_rows)}"
         )
+        if sanity_warnings:
+            prompt += (
+                "\n\nWarnings about this result (mention relevant caveats in your answer): "
+                + "; ".join(sanity_warnings)
+            )
+        return prompt
 
     def _build_viz_data(
         self,
@@ -997,3 +1170,153 @@ class ChatService:
             or "validation error" in lowered
             or "field required" in lowered
         )
+
+    # ------------------------------------------------------------------ #
+    #  Tier 1A: Schema validation (zero LLM cost)                        #
+    # ------------------------------------------------------------------ #
+
+    def _validate_query_plan_against_schema(self, query_plan: dict, data_source: dict) -> list[str]:
+        """Validate the LLM-generated query plan against the known schema. Returns warnings."""
+        warnings: list[str] = []
+        schema = data_source.get("schema_cache", {})
+        selected = set(data_source.get("selected_tables", []))
+        known_tables = {str(t["name"]) for t in schema.get("tables", []) if t.get("name")}
+        known_fields: dict[str, set[str]] = {}
+        for t in schema.get("tables", []):
+            known_fields[str(t["name"])] = {str(f["name"]) for f in t.get("fields", []) if f.get("name")}
+
+        source_type = data_source["type"]
+        if source_type == "mongodb":
+            collection = query_plan.get("collection", "")
+            if collection and collection not in known_tables:
+                warnings.append(f"Collection '{collection}' not found in schema.")
+            if selected and collection and collection not in selected:
+                warnings.append(f"Collection '{collection}' is not in selected tables.")
+            # Check field references in pipeline
+            pipeline = query_plan.get("pipeline", [])
+            if pipeline and collection and collection in known_fields:
+                mongo_refs = self._extract_mongo_field_refs(pipeline)
+                table_fields = known_fields[collection]
+                # Also include _id as it's always present
+                table_fields_lower = {f.lower() for f in table_fields} | {"_id", "id"}
+                for ref in mongo_refs:
+                    if ref.lower() not in table_fields_lower:
+                        warnings.append(f"Field '${ref}' not found in collection '{collection}'.")
+        else:
+            query = query_plan.get("query", "")
+            if query:
+                referenced = self._extract_sql_identifiers(query)
+                all_known_cols: set[str] = set()
+                for fields in known_fields.values():
+                    all_known_cols.update(f.lower() for f in fields)
+                all_known_tables_lower = {t.lower() for t in known_tables}
+                # Also include common SQL aliases and functions
+                ignore_idents = {"t", "t1", "t2", "a", "b", "c", "sub", "cte", "total", "result"}
+                for ident in referenced:
+                    ident_lower = ident.lower()
+                    if (
+                        ident_lower not in all_known_cols
+                        and ident_lower not in all_known_tables_lower
+                        and ident_lower not in ignore_idents
+                        and ident_lower not in SQL_KEYWORDS
+                    ):
+                        warnings.append(f"Identifier '{ident}' not found in schema.")
+
+        return warnings[:5]  # Cap to avoid overwhelming retry prompt
+
+    def _extract_sql_identifiers(self, query: str) -> set[str]:
+        """Extract non-keyword identifiers from SQL for validation."""
+        # Remove string literals
+        cleaned = re.sub(r"'[^']*'", "", query)
+        # Remove numbers
+        cleaned = re.sub(r"\b\d+(\.\d+)?\b", "", cleaned)
+        # Remove quoted identifiers but keep the name
+        cleaned = re.sub(r'"([^"]+)"', r"\1", cleaned)
+        # Extract word-like identifiers
+        tokens = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", cleaned)
+        return {t for t in tokens if t.lower() not in SQL_KEYWORDS}
+
+    def _extract_mongo_field_refs(self, pipeline: list) -> set[str]:
+        """Extract field references (e.g. $fieldName) from a MongoDB pipeline."""
+        refs: set[str] = set()
+
+        def _walk(obj: object) -> None:
+            if isinstance(obj, str) and obj.startswith("$") and not obj.startswith("$$"):
+                field = obj.lstrip("$").split(".")[0]
+                if field and not field.startswith("$"):
+                    refs.add(field)
+            elif isinstance(obj, dict):
+                for value in obj.values():
+                    _walk(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item)
+
+        _walk(pipeline)
+        return refs
+
+    # ------------------------------------------------------------------ #
+    #  Tier 1B: Result sanity checks (zero LLM cost)                     #
+    # ------------------------------------------------------------------ #
+
+    def _sanity_check_results(self, question: str, query_plan: dict, rows: list[dict]) -> list[str]:
+        """Lightweight heuristic checks on query results. Returns warnings."""
+        warnings: list[str] = []
+        if not rows:
+            return warnings
+
+        # Check: single-row result for a question that implies multiple
+        plural_signals = {"all", "each", "every", "list", "compare", "by", "per", "breakdown", "top", "distribution"}
+        q_words = set(question.lower().split())
+        if len(rows) == 1 and q_words.intersection(plural_signals):
+            warnings.append("Query returned only 1 row but the question implies multiple results.")
+
+        # Check: result has only null/zero values in all numeric columns
+        numeric_values = [v for row in rows for v in row.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if numeric_values and all(v == 0 for v in numeric_values):
+            warnings.append("All numeric values in the result are zero.")
+
+        # Check: returned columns don't overlap with anything in the question
+        if len(rows[0]) > 1:
+            result_keys = set()
+            for k in rows[0].keys():
+                result_keys.update(k.lower().replace("_", " ").split())
+            q_lower = question.lower()
+            meaningful_q_words = {w for w in q_words if len(w) > 3}
+            has_match = any(
+                word in q_lower or any(qw in word for qw in meaningful_q_words)
+                for word in result_keys
+                if len(word) > 2
+            )
+            if not has_match and meaningful_q_words:
+                warnings.append("Result columns don't appear related to the question.")
+
+        return warnings[:3]
+
+    # ------------------------------------------------------------------ #
+    #  Tier 1C: Error formatting                                         #
+    # ------------------------------------------------------------------ #
+
+    def _format_query_error(self, error: str, validation_warnings: list[str] | None = None) -> str:
+        """Format a query execution error into a user-friendly message."""
+        # Simplify common DB error messages
+        error_lower = error.lower()
+        if "column" in error_lower and "does not exist" in error_lower:
+            hint = "The generated query referenced a column that doesn't exist in the database."
+        elif "relation" in error_lower and "does not exist" in error_lower:
+            hint = "The generated query referenced a table that doesn't exist in the database."
+        elif "syntax error" in error_lower:
+            hint = "The generated query had a syntax error."
+        elif "permission denied" in error_lower:
+            hint = "The database denied permission to run this query."
+        elif "timeout" in error_lower or "timed out" in error_lower:
+            hint = "The query took too long to execute."
+        else:
+            hint = f"The generated query could not be executed: {error}"
+
+        parts = [hint]
+        if validation_warnings:
+            parts.append("Detected issues: " + "; ".join(validation_warnings) + ".")
+        parts.append("Try rephrasing your question, or check that the right tables and columns are selected in the source preview.")
+        return "\n\n".join(parts)
+

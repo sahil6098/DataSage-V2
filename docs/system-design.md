@@ -150,7 +150,27 @@ The chat response returns:
 ## Recommended Next Improvements
 
 1. Add background schema snapshots for very large databases.
-2. Cache successful query plans by normalized question plus schema hash.
-3. Add redis-backed token budgeting for multi-instance deployments.
-4. Add unit tests for URI validation, schema merging, and SQL safety guards.
-5. Add a saved-source delete endpoint and audit trail UI.
+2. Add redis-backed token budgeting for multi-instance deployments.
+3. Add unit tests for URI validation, schema merging, and SQL safety guards.
+4. Add a saved-source delete endpoint and audit trail UI.
+5. Add a frontend "This looks wrong" flag button with optional re-analysis.
+
+## Query Validation and Error Recovery
+
+### What does not use extra LLM calls
+
+- Schema validation: column and table existence checks before execution
+- Result sanity checks: detects all-zero results, single-row for plural questions, unrelated columns
+- Graceful error recovery: catches DB execution errors and returns actionable messages
+- Query plan caching: reuses successful plans for repeated questions
+
+### What uses at most 1 extra LLM call (conditional)
+
+- Retry with error feedback: if schema validation detects issues, the query is re-planned once with the specific validation errors injected into the prompt
+
+### LLM self-check (zero extra calls)
+
+- The query planner prompt now includes a `confidence` field (high/medium/low)
+- Low-confidence plans trigger warnings in the user-facing response
+- The prompt instructs the LLM to verify field names against the provided schema before writing the query
+
