@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from pydantic import BaseModel
@@ -18,9 +17,8 @@ from app.services.token_budget_service import TokenBudgetService
 
 logger = get_logger(__name__)
 
-SUPPORTED_PROVIDERS = {"gemini", "groq", "deepseek"}
+SUPPORTED_PROVIDERS = {"groq", "deepseek"}
 PROVIDER_LABELS = {
-    "gemini": "Gemini",
     "groq": "Groq",
     "deepseek": "DeepSeek",
 }
@@ -32,12 +30,10 @@ class LlmService:
         self.budget_service = TokenBudgetService()
 
     def available_providers(self) -> list[str]:
-        """Return providers in priority order: Groq (fastest) → Gemini → DeepSeek (slowest)."""
+        """Return providers in priority order: Groq slots, then DeepSeek."""
         providers = []
-        if self.settings.groq_api_key:
+        if self.settings.groq_slots:
             providers.append("groq")
-        if self.settings.gemini_api_key:
-            providers.append("gemini")
         if self.settings.huggingface_api_key:
             providers.append("deepseek")
         return providers
@@ -61,7 +57,7 @@ class LlmService:
         selected_provider = self._normalize_provider(preferred_provider)
         providers = self._provider_order(preferred_provider)
         if not providers:
-            raise ValueError("No LLM provider is configured. Add a Gemini, Groq, or HuggingFace API key.")
+            raise ValueError("No LLM provider is configured. Add a Groq key slot or a HuggingFace API key.")
 
         last_error: Exception | None = None
         estimated_tokens = (
@@ -134,7 +130,7 @@ class LlmService:
         selected_provider = self._normalize_provider(preferred_provider)
         providers = self._provider_order(preferred_provider)
         if not providers:
-            raise ValueError("No LLM provider is configured. Add a Gemini, Groq, or HuggingFace API key.")
+            raise ValueError("No LLM provider is configured. Add a Groq key slot or a HuggingFace API key.")
 
         last_error: Exception | None = None
         estimated_tokens = (
@@ -177,7 +173,7 @@ class LlmService:
         selected_provider = self._normalize_provider(preferred_provider)
         providers = self._provider_order(preferred_provider)
         if not providers:
-            raise ValueError("No LLM provider is configured. Add a Gemini, Groq, or HuggingFace API key.")
+            raise ValueError("No LLM provider is configured. Add a Groq key slot or a HuggingFace API key.")
 
         last_error: Exception | None = None
         estimated_tokens = (
@@ -217,27 +213,40 @@ class LlmService:
         raise ValueError("All configured LLM providers are currently rate-limited.")
 
     def _provider_order(self, preferred_provider: str | None) -> list[str]:
-        available = self.available_providers()
-        preferred = self._normalize_provider(preferred_provider)
+        available = self._available_provider_candidates()
+        explicit_preferred = self._normalize_provider(preferred_provider)
+        preferred = explicit_preferred or self._normalize_provider(self.settings.llm_default_provider)
         if not preferred:
             return available
         if preferred not in SUPPORTED_PROVIDERS:
             supported = ", ".join(sorted(self._provider_label(provider) for provider in SUPPORTED_PROVIDERS))
             raise ValueError(f"Unsupported LLM provider '{preferred_provider}'. Choose one of: {supported}.")
-        if preferred not in available:
-            key_names = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "deepseek": "HUGGINGFACE_API_KEY"}
+        preferred_candidates = [candidate for candidate in available if self._normalize_provider(candidate) == preferred]
+        if not preferred_candidates:
+            if not explicit_preferred:
+                return available
+            key_names = {"groq": "GROQ_API_KEY_1..10", "deepseek": "HUGGINGFACE_API_KEY"}
             key_name = key_names.get(preferred, f"{preferred.upper()}_API_KEY")
             raise ValueError(
                 f"{self._provider_label(preferred)} is selected, but {key_name} is not configured on the backend."
             )
-        # Put preferred first, then add remaining available providers as fallbacks
-        return [preferred] + [p for p in available if p != preferred]
+        return preferred_candidates + [candidate for candidate in available if candidate not in preferred_candidates]
+
+    def _available_provider_candidates(self) -> list[str]:
+        candidates = [f"groq:{slot['slot']}" for slot in self.settings.groq_slots]
+        if self.settings.huggingface_api_key:
+            candidates.append("deepseek")
+        return candidates
 
     def _normalize_provider(self, provider: str | None) -> str | None:
         normalized = (provider or "").strip().lower()
+        if normalized.startswith("groq:"):
+            return "groq"
         return normalized or None
 
     def _provider_label(self, provider: str) -> str:
+        if provider.startswith("groq:"):
+            return f"Groq slot {provider.split(':', 1)[1]}"
         return PROVIDER_LABELS.get(provider, provider)
 
     def _rate_limit_message(self, provider: str) -> str:
@@ -245,15 +254,6 @@ class LlmService:
 
     def _build_model(self, provider: str, max_output_tokens: int):
         timeout = self.settings.llm_timeout_seconds
-        if provider == "gemini":
-            return ChatGoogleGenerativeAI(
-                model=self.settings.gemini_model,
-                google_api_key=self.settings.gemini_api_key,
-                temperature=0.1,
-                timeout=timeout,
-                max_retries=0,
-                max_output_tokens=max_output_tokens,
-            )
         if provider == "deepseek":
             ds_timeout = self.settings.deepseek_timeout_seconds
             # Cap output tokens for DeepSeek free tier to conserve budget
@@ -268,13 +268,28 @@ class LlmService:
                 provider="auto",
             )
             return ChatHuggingFace(llm=llm)
+        slot = self._groq_slot(provider)
         return ChatGroq(
-            model_name=self.settings.groq_model,
-            groq_api_key=self.settings.groq_api_key,
+            model_name=str(slot["model"]),
+            groq_api_key=str(slot["api_key"]),
             temperature=0.1,
             timeout=timeout,
             max_tokens=max_output_tokens,
         )
+
+    def _groq_slot(self, provider: str) -> dict[str, str | int]:
+        slot_number = 1
+        if provider.startswith("groq:"):
+            try:
+                slot_number = int(provider.split(":", 1)[1])
+            except ValueError:
+                slot_number = 1
+        for slot in self.settings.groq_slots:
+            if slot["slot"] == slot_number:
+                return slot
+        if self.settings.groq_slots:
+            return self.settings.groq_slots[0]
+        raise ValueError("Groq is selected, but no GROQ_API_KEY slot is configured.")
 
     def _extract_text(self, content: str | list | dict) -> str:
         if isinstance(content, str):

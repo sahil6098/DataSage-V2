@@ -1,0 +1,221 @@
+import hashlib
+import math
+import re
+from typing import Any
+
+from bson import ObjectId
+
+from app.core.config import get_settings
+from app.db.mongo import get_database
+from app.utils.time import ist_now
+
+RECENT_CONTEXT_TURN_LIMIT = 4
+
+
+class SessionMemoryService:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+        self.db = get_database()
+        self.collection = self.db.chat_vectors
+        self.dimensions = self.settings.memory_embedding_dimensions
+
+    async def remember_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        question: str,
+        answer: str,
+    ) -> None:
+        content = f"User: {question.strip()}\nAssistant: {answer.strip()}".strip()
+        if len(content) < 24:
+            return
+
+        now = ist_now()
+        await self.collection.insert_one(
+            {
+                "user_id": user_id,
+                "session_id": session_id,
+                "kind": "chat_turn",
+                "question": question.strip(),
+                "answer": answer.strip(),
+                "content": content,
+                "embedding": self.embed(content),
+                "created_at": now,
+            }
+        )
+        await self._trim_session_memory(user_id=user_id, session_id=session_id)
+
+    async def recall_context(self, *, user_id: str, session_id: str, question: str) -> str:
+        recent_context = await self._recent_turn_context(user_id=user_id, session_id=session_id)
+        memories = await self.recall(user_id=user_id, session_id=session_id, query=question)
+
+        sections = []
+        if recent_context:
+            sections.append(recent_context)
+
+        if memories:
+            lines = ["Relevant previous turns from this session:"]
+            for index, memory in enumerate(memories, start=1):
+                question_text = self._truncate(str(memory.get("question") or ""), 240)
+                answer_text = self._truncate(str(memory.get("answer") or ""), 520)
+                lines.append(f"{index}. User asked: {question_text}\nAssistant answered: {answer_text}")
+            sections.append("\n".join(lines))
+
+        return "\n\n".join(sections)
+
+    async def recall(self, *, user_id: str, session_id: str, query: str) -> list[dict[str, Any]]:
+        query_vector = self.embed(query)
+        limit = self.settings.memory_recall_limit
+        vector_results = await self._recall_with_vector_search(
+            user_id=user_id,
+            session_id=session_id,
+            query_vector=query_vector,
+            limit=limit,
+        )
+        if vector_results:
+            return vector_results
+        return await self._recall_with_local_cosine(
+            user_id=user_id,
+            session_id=session_id,
+            query_vector=query_vector,
+            limit=limit,
+        )
+
+    def embed(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
+        features = tokens + [f"{tokens[i]} {tokens[i + 1]}" for i in range(max(0, len(tokens) - 1))]
+
+        for feature in features:
+            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
+            bucket = int.from_bytes(digest[:4], "big") % self.dimensions
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[bucket] += sign
+
+        norm = math.sqrt(sum(value * value for value in vector))
+        if not norm:
+            return vector
+        return [round(value / norm, 6) for value in vector]
+
+    async def _recall_with_vector_search(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        query_vector: list[float],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": self.settings.memory_vector_index_name,
+                    "path": "embedding",
+                    "queryVector": query_vector,
+                    "numCandidates": max(25, limit * 8),
+                    "limit": limit,
+                    "filter": {"user_id": user_id, "session_id": session_id},
+                }
+            },
+            {"$project": {"question": 1, "answer": 1, "created_at": 1, "score": {"$meta": "vectorSearchScore"}}},
+        ]
+        try:
+            return await self.collection.aggregate(pipeline).to_list(length=limit)
+        except Exception:
+            return []
+
+    async def _recall_with_local_cosine(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        query_vector: list[float],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        cursor = (
+            self.collection.find(
+                {"user_id": user_id, "session_id": session_id},
+                {"question": 1, "answer": 1, "embedding": 1, "created_at": 1},
+            )
+            .sort("created_at", -1)
+            .limit(80)
+        )
+        memories = await cursor.to_list(length=80)
+        scored = []
+        for memory in memories:
+            score = self._dot(query_vector, memory.get("embedding") or [])
+            if score > 0.08:
+                memory["score"] = score
+                scored.append(memory)
+        scored.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return scored[:limit]
+
+    async def _trim_session_memory(self, *, user_id: str, session_id: str) -> None:
+        max_turns = self.settings.memory_max_turns_per_session
+        if max_turns <= 0:
+            return
+        cursor = (
+            self.collection.find({"user_id": user_id, "session_id": session_id}, {"_id": 1})
+            .sort("created_at", -1)
+            .skip(max_turns)
+        )
+        stale_ids = [item["_id"] for item in await cursor.to_list(length=1000)]
+        if stale_ids:
+            await self.collection.delete_many({"_id": {"$in": stale_ids}})
+
+    async def _recent_turn_context(self, *, user_id: str, session_id: str) -> str:
+        try:
+            session_object_id = ObjectId(session_id)
+        except Exception:
+            return ""
+
+        session = await self.db.sessions.find_one(
+            {"_id": session_object_id, "user_id": user_id},
+            {"messages": {"$slice": -RECENT_CONTEXT_TURN_LIMIT * 2}},
+        )
+        if not session:
+            return ""
+
+        messages = session.get("messages", [])
+        if not messages:
+            return ""
+
+        turns: list[tuple[str, str]] = []
+        pending_user: str | None = None
+        for message in messages:
+            role = message.get("role")
+            content = self._truncate(str(message.get("content") or ""), 520)
+            if role == "user":
+                if pending_user:
+                    turns.append((pending_user, ""))
+                pending_user = content
+            elif role == "assistant" and pending_user:
+                turns.append((pending_user, content))
+                pending_user = None
+
+        if pending_user:
+            turns.append((pending_user, ""))
+
+        if not turns:
+            return ""
+
+        lines = [
+            "Most recent conversation turns from this session, oldest to newest.",
+            "Use the newest turn first when resolving follow-up words like it, that, same, only, now, previous, last answer, or for <entity>.",
+        ]
+        for index, (question_text, answer_text) in enumerate(turns[-RECENT_CONTEXT_TURN_LIMIT:], start=1):
+            lines.append(f"{index}. Previous user: {question_text}")
+            if answer_text:
+                lines.append(f"   Previous assistant: {answer_text}")
+        return "\n".join(lines)
+
+    def _dot(self, left: list[float], right: list[float]) -> float:
+        if len(left) != len(right):
+            return 0.0
+        return sum(a * b for a, b in zip(left, right))
+
+    def _truncate(self, text: str, max_chars: int) -> str:
+        normalized = " ".join(text.split())
+        if len(normalized) <= max_chars:
+            return normalized
+        return f"{normalized[: max_chars - 3].rstrip()}..."

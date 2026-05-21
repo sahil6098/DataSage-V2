@@ -2070,11 +2070,6 @@ button {
   color: white;
 }
 
-.provider-option-icon.gemini {
-  background: linear-gradient(135deg, #0891b2, #38bdf8);
-  box-shadow: 0 12px 22px rgba(14, 165, 233, 0.22);
-}
-
 .provider-option-icon.groq {
   background: linear-gradient(135deg, #2563eb, #1d4ed8);
   box-shadow: 0 12px 22px rgba(37, 99, 235, 0.22);

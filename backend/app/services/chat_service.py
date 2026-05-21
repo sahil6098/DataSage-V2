@@ -12,6 +12,7 @@ from langgraph.graph import END, START, StateGraph
 from app.schemas.chat import AnalysisAnswerPayload, MongoAnalysisPlan, SqlAnalysisPlan
 from app.services.connector_service import ConnectorService
 from app.services.llm_service import LlmService
+from app.services.memory_service import SessionMemoryService
 from app.services.session_service import SessionService
 from app.core.logging import get_logger
 from app.utils.time import ist_now
@@ -51,12 +52,14 @@ class AnalysisState(TypedDict, total=False):
     question: str
     data_source: dict
     schema_context: str
+    memory_context: str
     query_plan: dict
     result_rows: list[dict]
     answer_payload: dict
     validation_warnings: list[str]
     execution_error: str | None
     retry_count: int
+    execution_retry_count: int
     low_confidence: bool
 
 
@@ -87,6 +90,7 @@ class ChatService:
         self.connector_service = ConnectorService()
         self.session_service = SessionService()
         self.llm_service = LlmService()
+        self.memory_service = SessionMemoryService()
         self.query_cache = QueryPlanCache()
         self.graph = self._build_graph()
 
@@ -111,6 +115,21 @@ class ChatService:
                 session_id=session_id,
                 question=question,
                 message=small_talk_reply,
+            ):
+                yield event
+            return
+
+        history_reply = await self._history_reply(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+        )
+        if history_reply:
+            async for event in self._stream_prebuilt_reply(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=history_reply,
             ):
                 yield event
             return
@@ -141,6 +160,11 @@ class ChatService:
             raise ValueError("No data source connected to this session.")
 
         schema_context = self._build_schema_context(data_source)
+        memory_context = await self.memory_service.recall_context(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+        )
         state: AnalysisState = {
             "user_id": user_id,
             "session_id": session_id,
@@ -148,6 +172,7 @@ class ChatService:
             "question": question,
             "data_source": data_source,
             "schema_context": schema_context,
+            "memory_context": memory_context,
         }
 
         # --- Tier 4: Check query plan cache ---
@@ -166,6 +191,18 @@ class ChatService:
         state.update(await self._execute_query(state))
 
         execution_error = state.get("execution_error")
+        if execution_error and state.get("execution_retry_count", 0) < MAX_QUERY_RETRIES:
+            yield self._stage_event("planning", "Repairing query")
+            state["execution_retry_count"] = state.get("execution_retry_count", 0) + 1
+            state["execution_error"] = execution_error
+            state["result_rows"] = []
+            state.update(await self._plan_query(state))
+
+            yield self._stage_event("querying", "Inspecting data")
+            state["execution_error"] = None
+            state.update(await self._execute_query(state))
+            execution_error = state.get("execution_error")
+
         if execution_error:
             error_message = self._format_query_error(execution_error, state.get("validation_warnings"))
             async for event in self._stream_prebuilt_reply(
@@ -204,6 +241,7 @@ class ChatService:
             system_prompt=self._answer_prompt(),
             user_prompt=self._answer_user_prompt(
                 question=question,
+                memory_context=state.get("memory_context", ""),
                 query_plan=state["query_plan"],
                 rows=rows,
                 sanity_warnings=sanity_warnings,
@@ -237,12 +275,12 @@ class ChatService:
             plan_to_cache = {**state["query_plan"], "_cached_provider": state.get("provider_used")}
             self.query_cache.put(question, schema_context, plan_to_cache)
 
-        now = ist_now()
-        await self.session_service.append_messages(
-            user_id,
-            session_id,
-            {"role": "user", "content": question, "created_at": now},
-            {"role": "assistant", "content": message, "viz_data": viz_data, "created_at": now},
+        await self._append_turn(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            message=message,
+            viz_data=viz_data,
         )
 
         yield {
@@ -267,15 +305,32 @@ class ChatService:
         data_source = await self.session_service.get_data_source(user_id, session_id)
         small_talk_reply = self._small_talk_reply(question, has_data_source=bool(data_source))
         if small_talk_reply:
-            now = ist_now()
-            await self.session_service.append_messages(
-                user_id,
-                session_id,
-                {"role": "user", "content": question, "created_at": now},
-                {"role": "assistant", "content": small_talk_reply, "viz_data": None, "created_at": now},
+            await self._append_turn(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=small_talk_reply,
             )
             return {
                 "message": small_talk_reply,
+                "viz_data": None,
+                "provider_used": None,
+            }
+
+        history_reply = await self._history_reply(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+        )
+        if history_reply:
+            await self._append_turn(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=history_reply,
+            )
+            return {
+                "message": history_reply,
                 "viz_data": None,
                 "provider_used": None,
             }
@@ -289,12 +344,11 @@ class ChatService:
                     schema_reply=data_source_reply,
                     provider_preference=provider_preference,
                 )
-                now = ist_now()
-                await self.session_service.append_messages(
-                    user_id,
-                    session_id,
-                    {"role": "user", "content": question, "created_at": now},
-                    {"role": "assistant", "content": message, "viz_data": None, "created_at": now},
+                await self._append_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    question=question,
+                    message=message,
                 )
                 return {
                     "message": message,
@@ -302,12 +356,11 @@ class ChatService:
                     "provider_used": provider_used,
                 }
 
-            now = ist_now()
-            await self.session_service.append_messages(
-                user_id,
-                session_id,
-                {"role": "user", "content": question, "created_at": now},
-                {"role": "assistant", "content": data_source_reply, "viz_data": None, "created_at": now},
+            await self._append_turn(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=data_source_reply,
             )
             return {
                 "message": data_source_reply,
@@ -319,6 +372,11 @@ class ChatService:
             raise ValueError("No data source connected to this session.")
 
         schema_context = self._build_schema_context(data_source)
+        memory_context = await self.memory_service.recall_context(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+        )
         state = await self.graph.ainvoke(
             {
                 "user_id": user_id,
@@ -327,13 +385,18 @@ class ChatService:
                 "question": question,
                 "data_source": data_source,
                 "schema_context": schema_context,
+                "memory_context": memory_context,
             }
         )
 
         answer_payload = state["answer_payload"]
         message = answer_payload["answer"].strip()
         viz_data = None
-        if answer_payload.get("needs_visualization") and state.get("result_rows"):
+        if (
+            answer_payload.get("needs_visualization")
+            and self._user_requested_visualization(question)
+            and state.get("result_rows")
+        ):
             viz_payload = {
                 "rows": state["result_rows"],
                 "chart_type": answer_payload.get("chart_type"),
@@ -343,12 +406,12 @@ class ChatService:
             }
             viz_data = json.dumps(viz_payload, ensure_ascii=False)
 
-        now = ist_now()
-        await self.session_service.append_messages(
-            user_id,
-            session_id,
-            {"role": "user", "content": question, "created_at": now},
-            {"role": "assistant", "content": message, "viz_data": viz_data, "created_at": now},
+        await self._append_turn(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            message=message,
+            viz_data=viz_data,
         )
 
         return {
@@ -428,6 +491,50 @@ class ChatService:
             )
 
         return self._describe_data_source(data_source, include_columns=self._is_column_request(question))
+
+    async def _history_reply(self, *, user_id: str, session_id: str, question: str) -> str | None:
+        normalized = question.lower().translate(str.maketrans("", "", string.punctuation))
+        normalized = " ".join(normalized.split())
+
+        wants_last_question = normalized in {
+            "what was my last question",
+            "what was my previous question",
+            "tell me my last question",
+            "last question",
+            "previous question",
+        }
+        wants_first_question = normalized in {
+            "which question i asked first",
+            "what was my first question",
+            "tell me my first question",
+            "first question",
+        }
+        wants_last_answer = normalized in {
+            "what was your last answer",
+            "what did you answer last",
+            "show last answer",
+            "last answer",
+        }
+        if not (wants_last_question or wants_first_question or wants_last_answer):
+            return None
+
+        messages = await self.session_service.get_messages(user_id, session_id)
+        if wants_last_question:
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    return f'Your previous question was: "{str(message.get("content") or "").strip()}".'
+            return "I do not see a previous question in this session yet."
+
+        if wants_first_question:
+            for message in messages:
+                if message.get("role") == "user":
+                    return f'Your first question was: "{str(message.get("content") or "").strip()}".'
+            return "I do not see a previous question in this session yet."
+
+        for message in reversed(messages):
+            if message.get("role") == "assistant":
+                return f"My previous answer was:\n\n{str(message.get('content') or '').strip()}"
+        return "I do not see a previous answer in this session yet."
 
     def _is_data_source_question(self, question: str) -> bool:
         normalized = question.lower().translate(str.maketrans("", "", string.punctuation))
@@ -616,12 +723,11 @@ class ChatService:
                 await asyncio.sleep(0.02)
 
         message = "".join(answer_chunks).strip()
-        now = ist_now()
-        await self.session_service.append_messages(
-            user_id,
-            session_id,
-            {"role": "user", "content": question, "created_at": now},
-            {"role": "assistant", "content": message, "viz_data": None, "created_at": now},
+        await self._append_turn(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            message=message,
         )
         yield {"type": "final", "payload": {"message": message, "viz_data": None, "provider_used": provider_used}}
 
@@ -803,6 +909,29 @@ class ChatService:
         row_text = f"{row_count} rows" if isinstance(row_count, int) else "unknown rows"
         return f"{name} ({row_text}, {field_count} fields)"
 
+    async def _append_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        question: str,
+        message: str,
+        viz_data: str | None = None,
+    ) -> None:
+        now = ist_now()
+        await self.session_service.append_messages(
+            user_id,
+            session_id,
+            {"role": "user", "content": question, "created_at": now},
+            {"role": "assistant", "content": message, "viz_data": viz_data, "created_at": now},
+        )
+        await self.memory_service.remember_turn(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            answer=message,
+        )
+
     async def _stream_prebuilt_reply(
         self,
         *,
@@ -817,12 +946,12 @@ class ChatService:
             yield {"type": "chunk", "content": chunk}
             await asyncio.sleep(0.02)
 
-        now = ist_now()
-        await self.session_service.append_messages(
-            user_id,
-            session_id,
-            {"role": "user", "content": question, "created_at": now},
-            {"role": "assistant", "content": message, "viz_data": viz_data, "created_at": now},
+        await self._append_turn(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            message=message,
+            viz_data=viz_data,
         )
         yield {"type": "final", "payload": {"message": message, "viz_data": viz_data}}
 
@@ -844,6 +973,17 @@ class ChatService:
         retry_count = state.get("retry_count", 0)
         prompt = self._query_planner_prompt(source_type)
         user_prompt = f"Question:\n{question}\n\nSchema context:\n{context}"
+        if state.get("memory_context"):
+            user_prompt += (
+                "\n\nUse this session memory to resolve follow-up wording like 'it', 'that', 'same', "
+                "'same chart', 'previous result', 'last answer', 'now give me', 'only for', or omitted filters. "
+                "Prefer the most recent conversation turn over older relevant turns. "
+                "When the current message only changes an entity, company, metric, period, or scenario "
+                "(for example 'now give me it for Nexora' or 'same for budget'), keep the latest request's "
+                "measure, time grain, visualization intent, and comparison shape, then replace only the changed filter. "
+                "Do not copy old facts unless they are needed to form the new query.\n"
+                f"{self._truncate_text(state['memory_context'], 1800)}"
+            )
 
         # --- Tier 3A: Inject previous validation errors on retry ---
         prev_warnings = state.get("validation_warnings", [])
@@ -852,6 +992,13 @@ class ChatService:
                 "\n\nYour previous query attempt had these problems:\n"
                 + "\n".join(f"- {w}" for w in prev_warnings)
                 + "\nPlease fix these issues and only use fields that exist in the schema."
+            )
+        if state.get("execution_error"):
+            user_prompt += (
+                "\n\nYour previous query failed when it ran:\n"
+                f"{self._truncate_text(str(state['execution_error']), 1200)}\n"
+                "Generate a corrected query. If MongoDB numeric values may be stored as strings, convert them safely "
+                "inside the pipeline before arithmetic or sorting."
             )
 
         try:
@@ -950,7 +1097,8 @@ class ChatService:
             "Never display raw IDs, ObjectIds, UUIDs, or numeric foreign keys to the user. "
             "If the data has both an ID and a name column, use only the name in your answer text and chart_title. "
             "Choose chart_type from: bar, horizontal_bar, line, donut, 3d_bar, radar, table. "
-            "needs_visualization must be true only when a visual would genuinely help."
+            "needs_visualization must be true only when the user explicitly asked for a chart, graph, plot, "
+            "dashboard, table visualization, or visual comparison and the rows support it."
         )
         limited_rows = self._compact_prompt_rows(rows)
         user_prompt = (
@@ -958,6 +1106,8 @@ class ChatService:
             f"Query plan:\n{self._json_for_prompt(state['query_plan'])}\n\n"
             f"Rows:\n{self._json_for_prompt(limited_rows)}"
         )
+        if state.get("memory_context"):
+            user_prompt += f"\n\n{self._truncate_text(state['memory_context'], 1800)}"
         try:
             payload, provider = await self.llm_service.invoke_json(
                 system_prompt=prompt,
@@ -972,7 +1122,11 @@ class ChatService:
                     "The analysis model returned malformed structured output while summarizing the result. Please try again."
                 ) from exc
             raise
-        payload.setdefault("needs_visualization", self._rows_are_chartable(rows))
+        payload["needs_visualization"] = bool(
+            payload.get("needs_visualization")
+            and self._user_requested_visualization(state["question"])
+            and self._rows_are_chartable(rows)
+        )
         payload.setdefault("chart_type", "bar")
         payload.setdefault("summary", "Query result")
         if provider:
@@ -1039,6 +1193,9 @@ class ChatService:
                 "always use $lookup to join with the related collection and $project to include the human-readable "
                 "name/title/label field instead of showing raw IDs. The result rows must contain readable names, not IDs. "
                 "If there is a 'name', 'title', or 'label' field in the same collection, group by that instead of the ID. "
+                "If a field may contain numbers stored as strings, use $convert with onError/onNull or $toDouble before "
+                "using it in $sum, $avg, $divide, $subtract, $multiply, sorting, or comparisons. "
+                "For percentages, guard division by zero and non-numeric values. "
                 "prefer aggregation answers suitable for dashboards and comparisons; "
                 "pipeline must be a valid JSON array of single-key stage objects like "
                 '{"$match": {"field": "value"}}, {"$group": {"_id": "$field", "count": {"$sum": 1}}}; '
@@ -1088,6 +1245,7 @@ class ChatService:
         self,
         *,
         question: str,
+        memory_context: str = "",
         query_plan: dict,
         rows: list[dict],
         sanity_warnings: list[str] | None = None,
@@ -1098,6 +1256,8 @@ class ChatService:
             f"Executed query plan:\n{self._json_for_prompt(query_plan)}\n\n"
             f"Rows:\n{self._json_for_prompt(limited_rows)}"
         )
+        if memory_context:
+            prompt += f"\n\n{self._truncate_text(memory_context, 1800)}"
         if sanity_warnings:
             prompt += (
                 "\n\nWarnings about this result (mention relevant caveats in your answer): "
@@ -1113,6 +1273,8 @@ class ChatService:
         rows: list[dict],
         answer: str,
     ) -> str | None:
+        if not self._user_requested_visualization(question):
+            return None
         if not self._rows_are_chartable(rows):
             return None
 
@@ -1129,6 +1291,16 @@ class ChatService:
             "summary": self._compact_question(question),
         }
         return json.dumps(viz_payload, ensure_ascii=False)
+
+    def _user_requested_visualization(self, question: str) -> bool:
+        normalized = question.lower()
+        return bool(
+            re.search(
+                r"\b(chart|graph|plot|visuali[sz]e|visuali[sz]ation|dashboard|bar chart|line chart|pie chart|donut|"
+                r"scatter|histogram|heatmap|trend chart|draw|show.*chart|show.*graph)\b",
+                normalized,
+            )
+        )
 
     def _compact_question(self, question: str) -> str:
         normalized = " ".join(question.split()).rstrip(" ?")

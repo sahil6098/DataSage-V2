@@ -23,18 +23,15 @@ class TokenBudgetService:
     def __init__(self) -> None:
         settings = get_settings()
         self.budgets = {
-            "gemini": BudgetSnapshot(
-                requests_per_minute=settings.gemini_requests_per_minute,
-                tokens_per_minute=settings.gemini_tokens_per_minute,
-                requests_per_day=1400,  # Gemini free tier: 1500/day, keep 100 buffer
-            ),
             "groq": BudgetSnapshot(
                 requests_per_minute=settings.groq_requests_per_minute,
                 tokens_per_minute=settings.groq_tokens_per_minute,
+                requests_per_day=settings.groq_requests_per_day,
             ),
             "deepseek": BudgetSnapshot(
                 requests_per_minute=settings.deepseek_requests_per_minute,
                 tokens_per_minute=settings.deepseek_tokens_per_minute,
+                requests_per_day=settings.deepseek_requests_per_day,
             ),
         }
         self.request_windows: dict[str, deque[float]] = defaultdict(deque)
@@ -49,8 +46,9 @@ class TokenBudgetService:
     async def reserve(self, provider: str, estimated_tokens: int) -> bool:
         async with self.lock:
             now = time()
+            budget_key = self._budget_key(provider)
             self._cleanup(provider, now)
-            budget = self.budgets[provider]
+            budget = self.budgets[budget_key]
             current_requests = len(self.request_windows[provider])
             current_tokens = sum(token_count for _, token_count in self.token_windows[provider])
             if current_requests + 1 > budget.requests_per_minute:
@@ -70,8 +68,9 @@ class TokenBudgetService:
     async def can_accept(self, provider: str, estimated_tokens: int) -> bool:
         async with self.lock:
             now = time()
+            budget_key = self._budget_key(provider)
             self._cleanup(provider, now)
-            budget = self.budgets[provider]
+            budget = self.budgets[budget_key]
             current_requests = len(self.request_windows[provider])
             current_tokens = sum(token_count for _, token_count in self.token_windows[provider])
             if current_requests + 1 > budget.requests_per_minute:
@@ -83,6 +82,11 @@ class TokenBudgetService:
                 if daily.count + 1 > budget.requests_per_day:
                     return False
             return True
+
+    def _budget_key(self, provider: str) -> str:
+        if provider.startswith("groq:"):
+            return "groq"
+        return provider
 
     def _get_daily(self, provider: str, now: float) -> DailyCounter:
         """Get or reset the daily counter for a provider."""

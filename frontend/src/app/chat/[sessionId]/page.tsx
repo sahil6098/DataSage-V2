@@ -2,7 +2,7 @@
 
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AlertCircle, BarChart3, Check, ChevronDown, Database, FileSpreadsheet, Menu, PlugZap, Sparkles, Unplug, Zap, UploadCloud, ArrowUp } from "lucide-react";
+import { AlertCircle, BarChart3, Check, ChevronDown, Database, FileSpreadsheet, FileText, Menu, PlugZap, Sparkles, Unplug, Zap, UploadCloud, ArrowUp } from "lucide-react";
 import api, { refreshAccessToken } from "@/lib/api";
 import { API_BASE_PATH } from "@/lib/api-base";
 import { getUserDisplayName } from "@/lib/auth-user";
@@ -19,7 +19,7 @@ const API = API_BASE_PATH;
 const MODEL_STORAGE_KEY = "llm_provider";
 const STREAM_FRAME_MS = 16;
 
-type LlmProvider = "groq" | "gemini" | "deepseek";
+type LlmProvider = "groq" | "deepseek";
 
 interface Message {
   role: string;
@@ -73,7 +73,6 @@ function isConnectorErrorMessage(message: string | null | undefined) {
 }
 
 function formatProviderLabel(provider: LlmProvider) {
-  if (provider === "gemini") return "Gemini";
   if (provider === "deepseek") return "DeepSeek";
   return "Groq";
 }
@@ -122,8 +121,9 @@ export default function ChatSessionPage() {
   const [sourceConfig, setSourceConfig] = useState<ConnectedSourceConfig | null>(null);
   const [previewRefreshToken, setPreviewRefreshToken] = useState(0);
   const [connectorModalMode, setConnectorModalMode] = useState<"all" | "database" | "file">("all");
-  const [llmProvider, setLlmProvider] = useState<LlmProvider>("gemini");
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>("groq");
   const [disconnecting, setDisconnecting] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const messageBudget = getMessageBudgetState(input);
@@ -137,8 +137,11 @@ export default function ChatSessionPage() {
 
   useEffect(() => {
     const savedProvider = typeof window !== "undefined" ? window.localStorage.getItem(MODEL_STORAGE_KEY) : null;
-    if (savedProvider === "groq" || savedProvider === "gemini" || savedProvider === "deepseek") {
+    if (savedProvider === "groq") {
       setLlmProvider(savedProvider);
+    } else if (typeof window !== "undefined") {
+      window.localStorage.setItem(MODEL_STORAGE_KEY, "groq");
+      setLlmProvider("groq");
     }
   }, []);
 
@@ -559,6 +562,54 @@ export default function ChatSessionPage() {
     }
   };
 
+  const handleDownloadReport = async () => {
+    if (!sessionId || reportLoading || messages.length === 0) {
+      return;
+    }
+
+    try {
+      setReportLoading(true);
+      let token = localStorage.getItem("access_token");
+      const requestReport = (accessToken: string | null) =>
+        fetch(`${API}/chat/${sessionId}/report`, {
+          headers: {
+            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+          },
+        });
+
+      let response = await requestReport(token);
+      if (response.status === 401) {
+        token = await refreshAccessToken();
+        response = await requestReport(token);
+      }
+
+      if (!response.ok) {
+        throw new Error((await response.text()) || "Report generation failed.");
+      }
+
+      const blob = await response.blob();
+      const contentDisposition = response.headers.get("content-disposition") || "";
+      const filenameMatch = contentDisposition.match(/filename="([^"]+)"/);
+      const filename = filenameMatch?.[1] || "datasage-report.pdf";
+      const href = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(href);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Report generation failed.";
+      setMessages((current) => [
+        ...current,
+        { role: "assistant", content: message, status: "complete", stage_label: undefined },
+      ]);
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
   const activeConnectorTab = searchParams.get("tab") === "file" ? "file" : "mongodb";
   const sourceConfigured = Boolean(sourceConfig);
 
@@ -602,6 +653,16 @@ export default function ChatSessionPage() {
                 </div>
 
                 <div className="chat-topbar-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void handleDownloadReport()}
+                    disabled={reportLoading || messages.length === 0}
+                    title={messages.length === 0 ? "Start the chat before generating a report" : "Generate report PDF"}
+                  >
+                    <FileText size={16} />
+                    {reportLoading ? "Creating PDF" : "Generate report"}
+                  </button>
                   {sourceConfigured ? (
 null
                   ) : (
@@ -732,13 +793,11 @@ null
                             </button>
 
                             <div className={`provider-menu ${modelMenuOpen ? "open" : ""}`} role="menu" aria-label="Select model">
-                              {(["gemini", "groq", "deepseek"] as LlmProvider[]).map((provider) => {
+                              {(["groq", "deepseek"] as LlmProvider[]).map((provider) => {
                                 const active = provider === llmProvider;
-                                const subtitle = provider === "gemini"
-                                  ? "Balanced multimodal analysis"
-                                  : provider === "deepseek"
-                                    ? "DeepSeek V4 via HuggingFace"
-                                    : "Fast structured reasoning";
+                                const subtitle = provider === "deepseek"
+                                  ? "DeepSeek via HuggingFace"
+                                  : "Groq key-pool fallback";
                                 return (
                                   <button
                                     key={provider}

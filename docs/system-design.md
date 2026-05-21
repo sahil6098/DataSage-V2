@@ -128,7 +128,7 @@ The chat response returns:
 - frontend token budget display
 - backend approximate token limit per message
 - in-memory per-provider request-per-minute and token-per-minute guards
-- provider fallback between Gemini and Groq when the preferred provider is unavailable
+- provider fallback across Groq key slots, then HuggingFace DeepSeek when the preferred provider is unavailable
 
 ## Visualization Design
 

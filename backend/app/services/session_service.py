@@ -39,6 +39,7 @@ class SessionService:
     async def delete_session(self, user_id: str, session_id: str) -> None:
         session = await self._fetch_owned_session(user_id, session_id)
         await self.db.sessions.delete_one({"_id": session["_id"]})
+        await self.db.chat_vectors.delete_many({"user_id": user_id, "session_id": session_id})
 
     async def append_messages(
         self,
@@ -88,6 +89,10 @@ class SessionService:
     async def get_data_source(self, user_id: str, session_id: str) -> dict | None:
         session = await self._fetch_owned_session(user_id, session_id)
         return session.get("data_source")
+
+    async def get_messages(self, user_id: str, session_id: str) -> list[dict]:
+        session = await self._fetch_owned_session(user_id, session_id)
+        return list(session.get("messages", []))
 
     async def _fetch_owned_session(self, user_id: str, session_id: str) -> dict:
         session = await self.db.sessions.find_one({"_id": ObjectId(session_id), "user_id": user_id})

@@ -3,7 +3,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-LlmProvider = Literal["gemini", "groq", "deepseek"]
+LlmProvider = Literal["groq", "deepseek"]
 
 
 class ChatRequest(BaseModel):

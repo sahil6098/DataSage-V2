@@ -1,16 +1,18 @@
 import json
 
 from fastapi import APIRouter, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from app.api.deps import CurrentUser
 from app.core.logging import get_logger
 from app.schemas.chat import ChatRequest
 from app.services.chat_service import ChatService
+from app.services.report_service import ReportService
 
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 service = ChatService()
+report_service = ReportService()
 logger = get_logger(__name__)
 
 
@@ -48,4 +50,28 @@ async def stream_chat(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{session_id}/report")
+async def chat_report(session_id: str, current_user: CurrentUser):
+    try:
+        pdf_bytes, filename = await report_service.generate_chat_report(
+            user_id=str(current_user["_id"]),
+            session_id=session_id,
+        )
+    except ValueError as exc:
+        return Response(content=str(exc), status_code=400, media_type="text/plain")
+    except Exception:
+        logger.exception("Unhandled chat report error for session %s", session_id)
+        return Response(
+            content="An error occurred while generating the report.",
+            status_code=500,
+            media_type="text/plain",
+        )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

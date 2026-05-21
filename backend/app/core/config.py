@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(Path(__file__).resolve().parents[2] / ".env", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -40,21 +40,48 @@ class Settings(BaseSettings):
     max_user_message_tokens: int = Field(default=1200, alias="MAX_USER_MESSAGE_TOKENS")
     max_chat_result_rows: int = Field(default=200, alias="MAX_CHAT_RESULT_ROWS")
 
-    gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-1.5-flash", alias="GEMINI_MODEL")
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
-    groq_model: str = Field(default="llama-3.1-8b-instant", alias="GROQ_MODEL")
+    groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
+    groq_api_key_1: str | None = Field(default=None, alias="GROQ_API_KEY_1")
+    groq_model_1: str | None = Field(default=None, alias="GROQ_MODEL_1")
+    groq_api_key_2: str | None = Field(default=None, alias="GROQ_API_KEY_2")
+    groq_model_2: str | None = Field(default=None, alias="GROQ_MODEL_2")
+    groq_api_key_3: str | None = Field(default=None, alias="GROQ_API_KEY_3")
+    groq_model_3: str | None = Field(default=None, alias="GROQ_MODEL_3")
+    groq_api_key_4: str | None = Field(default=None, alias="GROQ_API_KEY_4")
+    groq_model_4: str | None = Field(default=None, alias="GROQ_MODEL_4")
+    groq_api_key_5: str | None = Field(default=None, alias="GROQ_API_KEY_5")
+    groq_model_5: str | None = Field(default=None, alias="GROQ_MODEL_5")
+    groq_api_key_6: str | None = Field(default=None, alias="GROQ_API_KEY_6")
+    groq_model_6: str | None = Field(default=None, alias="GROQ_MODEL_6")
+    groq_api_key_7: str | None = Field(default=None, alias="GROQ_API_KEY_7")
+    groq_model_7: str | None = Field(default=None, alias="GROQ_MODEL_7")
+    groq_api_key_8: str | None = Field(default=None, alias="GROQ_API_KEY_8")
+    groq_model_8: str | None = Field(default=None, alias="GROQ_MODEL_8")
+    groq_api_key_9: str | None = Field(default=None, alias="GROQ_API_KEY_9")
+    groq_model_9: str | None = Field(default=None, alias="GROQ_MODEL_9")
+    groq_api_key_10: str | None = Field(default=None, alias="GROQ_API_KEY_10")
+    groq_model_10: str | None = Field(default=None, alias="GROQ_MODEL_10")
     huggingface_api_key: str | None = Field(default=None, alias="HUGGINGFACE_API_KEY")
-    deepseek_model: str = Field(default="deepseek-ai/DeepSeek-V4-Flash", alias="DEEPSEEK_MODEL")
+    huggingface_api_base: str = Field(default="https://router.huggingface.co/v1", alias="HUGGINGFACE_API_BASE")
+    deepseek_model: str = Field(default="deepseek-ai/DeepSeek-V4-Flash", alias="HUGGINGFACE_DEEPSEEK_MODEL")
+    llm_default_provider: str = Field(default="groq", alias="LLM_DEFAULT_PROVIDER")
+    openrouter_report_api_key: str | None = Field(default=None, alias="OPENROUTER_REPORT_API_KEY")
+    openrouter_report_model: str = Field(default="openai/gpt-oss-20b:free", alias="OPENROUTER_REPORT_MODEL")
     llm_timeout_seconds: int = Field(default=45, alias="LLM_TIMEOUT_SECONDS")
     deepseek_timeout_seconds: int = Field(default=90, alias="DEEPSEEK_TIMEOUT_SECONDS")
 
-    gemini_requests_per_minute: int = Field(default=10, alias="GEMINI_REQUESTS_PER_MINUTE")
     groq_requests_per_minute: int = Field(default=28, alias="GROQ_REQUESTS_PER_MINUTE")
     deepseek_requests_per_minute: int = Field(default=5, alias="DEEPSEEK_REQUESTS_PER_MINUTE")
-    gemini_tokens_per_minute: int = Field(default=30_000, alias="GEMINI_TOKENS_PER_MINUTE")
     groq_tokens_per_minute: int = Field(default=6_000, alias="GROQ_TOKENS_PER_MINUTE")
     deepseek_tokens_per_minute: int = Field(default=8_000, alias="DEEPSEEK_TOKENS_PER_MINUTE")
+    groq_requests_per_day: int = Field(default=950, alias="GROQ_REQUESTS_PER_DAY")
+    deepseek_requests_per_day: int = Field(default=0, alias="DEEPSEEK_REQUESTS_PER_DAY")
+
+    memory_embedding_dimensions: int = Field(default=384, alias="MEMORY_EMBEDDING_DIMENSIONS")
+    memory_recall_limit: int = Field(default=4, alias="MEMORY_RECALL_LIMIT")
+    memory_max_turns_per_session: int = Field(default=300, alias="MEMORY_MAX_TURNS_PER_SESSION")
+    memory_vector_index_name: str = Field(default="chat_vectors_index", alias="MEMORY_VECTOR_INDEX_NAME")
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -75,6 +102,20 @@ class Settings(BaseSettings):
             if normalized in {"debug", "dev", "development", "true", "1", "yes", "on"}:
                 return True
         return value
+
+    @property
+    def groq_slots(self) -> list[dict[str, str | int]]:
+        slots: list[dict[str, str | int]] = []
+        for index in range(1, 11):
+            key = getattr(self, f"groq_api_key_{index}", None)
+            model = getattr(self, f"groq_model_{index}", None) or self.groq_model
+            if not key or "YOUR_KEY" in key:
+                continue
+            slots.append({"slot": index, "api_key": key, "model": model})
+
+        if self.groq_api_key and not slots and "YOUR_KEY" not in self.groq_api_key:
+            slots.append({"slot": 1, "api_key": self.groq_api_key, "model": self.groq_model})
+        return slots
 
     @property
     def upload_path(self) -> Path:

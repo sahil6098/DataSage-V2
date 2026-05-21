@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.operations import SearchIndexModel
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -25,10 +26,33 @@ def get_database() -> AsyncIOMotorDatabase:
 
 async def init_db() -> None:
     db = get_database()
+    settings = get_settings()
     await db.users.create_index("email", unique=True)
     await db.sessions.create_index([("user_id", 1), ("updated_at", -1)])
+    await db.chat_vectors.create_index([("user_id", 1), ("session_id", 1), ("created_at", -1)])
     await db.saved_sources.create_index([("user_id", 1), ("uri_fingerprint", 1)], unique=True)
     await db.refresh_tokens.create_index([("user_id", 1), ("created_at", -1)])
+    try:
+        await db.chat_vectors.create_search_index(
+            SearchIndexModel(
+                name=settings.memory_vector_index_name,
+                type="vectorSearch",
+                definition={
+                    "fields": [
+                        {
+                            "type": "vector",
+                            "path": "embedding",
+                            "numDimensions": settings.memory_embedding_dimensions,
+                            "similarity": "cosine",
+                        },
+                        {"type": "filter", "path": "user_id"},
+                        {"type": "filter", "path": "session_id"},
+                    ]
+                },
+            )
+        )
+    except Exception as exc:
+        logger.info("MongoDB vector search index was not created automatically: %s", exc)
     logger.info("Mongo indexes ensured.")
 
 

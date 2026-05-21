@@ -7,7 +7,7 @@ FastAPI backend for the attached `frontend` app. It provides:
 - Secure data-source connections for MongoDB Atlas and Supabase PostgreSQL
 - CSV, Excel, and parquet uploads for chat analysis
 - Schema preview plus database/table/field descriptions saved per session
-- LangGraph-based query planning and answer synthesis with Gemini or Groq
+- LangGraph-based query planning and answer synthesis with Groq key-pool fallback or HuggingFace DeepSeek
 - IST-aware request and application logging
 
 ## Quick Startdb 
@@ -26,7 +26,7 @@ pip install -r requirements.txt
 - `JWT_SECRET_KEY`
 - `JWT_REFRESH_SECRET_KEY`
 - `ENCRYPTION_KEY`
-- `GEMINI_API_KEY` and/or `GROQ_API_KEY`
+- `GROQ_API_KEY_1` through `GROQ_API_KEY_10` and/or `HUGGINGFACE_API_KEY`
 
 4. Run the API:
 
