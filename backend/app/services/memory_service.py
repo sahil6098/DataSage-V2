@@ -9,7 +9,11 @@ from app.core.config import get_settings
 from app.db.mongo import get_database
 from app.utils.time import ist_now
 
-RECENT_CONTEXT_TURN_LIMIT = 4
+RECENT_CONTEXT_TURN_LIMIT = 8
+LOCAL_COSINE_MIN_SCORE = 0.04
+EMBEDDING_ANSWER_CHAR_LIMIT = 4_000
+CONTEXT_QUESTION_CHAR_LIMIT = 320
+CONTEXT_ANSWER_CHAR_LIMIT = 900
 
 
 class SessionMemoryService:
@@ -27,7 +31,10 @@ class SessionMemoryService:
         question: str,
         answer: str,
     ) -> None:
-        content = f"User: {question.strip()}\nAssistant: {answer.strip()}".strip()
+        question_text = question.strip()
+        answer_text = answer.strip()
+        embedding_answer = self._truncate(answer_text, EMBEDDING_ANSWER_CHAR_LIMIT)
+        content = f"User: {question_text}\nAssistant: {embedding_answer}".strip()
         if len(content) < 24:
             return
 
@@ -37,8 +44,8 @@ class SessionMemoryService:
                 "user_id": user_id,
                 "session_id": session_id,
                 "kind": "chat_turn",
-                "question": question.strip(),
-                "answer": answer.strip(),
+                "question": question_text,
+                "answer": answer_text,
                 "content": content,
                 "embedding": self.embed(content),
                 "created_at": now,
@@ -55,14 +62,29 @@ class SessionMemoryService:
             sections.append(recent_context)
 
         if memories:
-            lines = ["Relevant previous turns from this session:"]
+            lines = [
+                "--- SEMANTIC_MEMORY_MATCHES ---",
+                "Order: highest embedding relevance first. These may be older than the recent turns above.",
+            ]
             for index, memory in enumerate(memories, start=1):
-                question_text = self._truncate(str(memory.get("question") or ""), 240)
-                answer_text = self._truncate(str(memory.get("answer") or ""), 520)
-                lines.append(f"{index}. User asked: {question_text}\nAssistant answered: {answer_text}")
+                question_text = self._truncate(str(memory.get("question") or ""), CONTEXT_QUESTION_CHAR_LIMIT)
+                answer_text = self._truncate(str(memory.get("answer") or ""), CONTEXT_ANSWER_CHAR_LIMIT)
+                lines.append(f"[MATCH {index}]")
+                lines.append(f"User: {question_text}")
+                lines.append(f"Assistant: {answer_text}")
+            lines.append("--- END SEMANTIC_MEMORY_MATCHES ---")
             sections.append("\n".join(lines))
 
-        return "\n\n".join(sections)
+        if not sections:
+            return ""
+        return "\n".join(
+            [
+                "=== SESSION MEMORY CONTEXT ===",
+                "Use recent turns before semantic matches when resolving follow-up wording.",
+                *sections,
+                "=== END SESSION MEMORY CONTEXT ===",
+            ]
+        )
 
     async def recall(self, *, user_id: str, session_id: str, query: str) -> list[dict[str, Any]]:
         query_vector = self.embed(query)
@@ -144,7 +166,7 @@ class SessionMemoryService:
         scored = []
         for memory in memories:
             score = self._dot(query_vector, memory.get("embedding") or [])
-            if score > 0.08:
+            if score >= LOCAL_COSINE_MIN_SCORE:
                 memory["score"] = score
                 scored.append(memory)
         scored.sort(key=lambda item: item.get("score", 0), reverse=True)
@@ -184,12 +206,13 @@ class SessionMemoryService:
         pending_user: str | None = None
         for message in messages:
             role = message.get("role")
-            content = self._truncate(str(message.get("content") or ""), 520)
             if role == "user":
+                content = self._truncate(str(message.get("content") or ""), CONTEXT_QUESTION_CHAR_LIMIT)
                 if pending_user:
                     turns.append((pending_user, ""))
                 pending_user = content
             elif role == "assistant" and pending_user:
+                content = self._truncate(str(message.get("content") or ""), CONTEXT_ANSWER_CHAR_LIMIT)
                 turns.append((pending_user, content))
                 pending_user = None
 
@@ -199,14 +222,18 @@ class SessionMemoryService:
         if not turns:
             return ""
 
+        selected_turns = list(reversed(turns[-RECENT_CONTEXT_TURN_LIMIT:]))
         lines = [
-            "Most recent conversation turns from this session, oldest to newest.",
-            "Use the newest turn first when resolving follow-up words like it, that, same, only, now, previous, last answer, or for <entity>.",
+            "--- RECENT_SESSION_TURNS ---",
+            "Order: newest to oldest. [TURN 1] is the most recent completed exchange.",
         ]
-        for index, (question_text, answer_text) in enumerate(turns[-RECENT_CONTEXT_TURN_LIMIT:], start=1):
-            lines.append(f"{index}. Previous user: {question_text}")
+        for index, (question_text, answer_text) in enumerate(selected_turns, start=1):
+            recency_label = "newest" if index == 1 else f"{index - 1} turn(s) before newest"
+            lines.append(f"[TURN {index} - {recency_label}]")
+            lines.append(f"User: {question_text}")
             if answer_text:
-                lines.append(f"   Previous assistant: {answer_text}")
+                lines.append(f"Assistant: {answer_text}")
+        lines.append("--- END RECENT_SESSION_TURNS ---")
         return "\n".join(lines)
 
     def _dot(self, left: list[float], right: list[float]) -> float:

@@ -76,9 +76,15 @@ class Settings(BaseSettings):
     groq_tokens_per_minute: int = Field(default=6_000, alias="GROQ_TOKENS_PER_MINUTE")
     deepseek_tokens_per_minute: int = Field(default=8_000, alias="DEEPSEEK_TOKENS_PER_MINUTE")
     groq_requests_per_day: int = Field(default=950, alias="GROQ_REQUESTS_PER_DAY")
+    groq_tokens_per_day: int = Field(default=0, alias="GROQ_TOKENS_PER_DAY")
     deepseek_requests_per_day: int = Field(default=0, alias="DEEPSEEK_REQUESTS_PER_DAY")
+    deepseek_tokens_per_day: int = Field(default=0, alias="DEEPSEEK_TOKENS_PER_DAY")
 
     memory_embedding_dimensions: int = Field(default=384, alias="MEMORY_EMBEDDING_DIMENSIONS")
+    memory_embedding_model: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        alias="MEMORY_EMBEDDING_MODEL",
+    )
     memory_recall_limit: int = Field(default=4, alias="MEMORY_RECALL_LIMIT")
     memory_max_turns_per_session: int = Field(default=300, alias="MEMORY_MAX_TURNS_PER_SESSION")
     memory_vector_index_name: str = Field(default="chat_vectors_index", alias="MEMORY_VECTOR_INDEX_NAME")

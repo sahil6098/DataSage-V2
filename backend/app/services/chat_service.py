@@ -27,6 +27,7 @@ MAX_CONTEXT_SAMPLE_CHARS = 60
 MAX_PROMPT_ROWS = 10
 MAX_PROMPT_FIELDS_PER_ROW = 12
 MAX_PROMPT_VALUE_CHARS = 200
+MAX_MEMORY_CONTEXT_CHARS = 5_000
 MAX_QUERY_RETRIES = 1
 
 SQL_KEYWORDS = {
@@ -123,6 +124,7 @@ class ChatService:
             user_id=user_id,
             session_id=session_id,
             question=question,
+            provider_preference=provider_preference,
         )
         if history_reply:
             async for event in self._stream_prebuilt_reply(
@@ -321,6 +323,7 @@ class ChatService:
             user_id=user_id,
             session_id=session_id,
             question=question,
+            provider_preference=provider_preference,
         )
         if history_reply:
             await self._append_turn(
@@ -492,10 +495,19 @@ class ChatService:
 
         return self._describe_data_source(data_source, include_columns=self._is_column_request(question))
 
-    async def _history_reply(self, *, user_id: str, session_id: str, question: str) -> str | None:
+    async def _history_reply(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        question: str,
+        provider_preference: str | None = None,
+    ) -> str | None:
         normalized = question.lower().translate(str.maketrans("", "", string.punctuation))
         normalized = " ".join(normalized.split())
 
+        wants_session_summary = self._wants_session_summary(normalized)
+        last_message_count = self._last_message_count(normalized)
         wants_last_question = normalized in {
             "what was my last question",
             "what was my previous question",
@@ -515,10 +527,26 @@ class ChatService:
             "show last answer",
             "last answer",
         }
-        if not (wants_last_question or wants_first_question or wants_last_answer):
+        if not (
+            wants_session_summary
+            or last_message_count
+            or wants_last_question
+            or wants_first_question
+            or wants_last_answer
+        ):
             return None
 
         messages = await self.session_service.get_messages(user_id, session_id)
+        if wants_session_summary:
+            return await self._session_summary_reply(messages, provider_preference=provider_preference)
+
+        if last_message_count:
+            return await self._last_messages_reply(
+                messages,
+                count=last_message_count,
+                provider_preference=provider_preference,
+            )
+
         if wants_last_question:
             for message in reversed(messages):
                 if message.get("role") == "user":
@@ -535,6 +563,141 @@ class ChatService:
             if message.get("role") == "assistant":
                 return f"My previous answer was:\n\n{str(message.get('content') or '').strip()}"
         return "I do not see a previous answer in this session yet."
+
+    def _wants_session_summary(self, normalized: str) -> bool:
+        summary_phrases = {
+            "make summary of my session",
+            "make a summary of my session",
+            "summarize my session",
+            "summarise my session",
+            "session summary",
+            "summary of my session",
+            "summarize this session",
+            "summarise this session",
+            "summarize our conversation",
+            "summarise our conversation",
+            "what happened in this session",
+            "recap this session",
+            "give me a recap",
+        }
+        return normalized in summary_phrases or bool(
+            re.search(r"\b(summary|summari[sz]e|recap)\b.*\b(session|conversation|chat)\b", normalized)
+        )
+
+    def _last_message_count(self, normalized: str) -> int | None:
+        exact_last_message_phrases = {
+            "last message",
+            "what was my last message",
+            "what was the last message",
+            "explain last message",
+            "explain the last message",
+            "show last message",
+            "tell me last message",
+        }
+        if normalized in exact_last_message_phrases:
+            return 1
+
+        match = re.search(
+            r"\blast\s+(\d+)\s+(message|messages|msg|msgs|conversation messages|chat messages)\b",
+            normalized,
+        )
+        if not match:
+            return None
+        return max(1, min(int(match.group(1)), 20))
+
+    async def _session_summary_reply(
+        self,
+        messages: list[dict],
+        *,
+        provider_preference: str | None,
+    ) -> str:
+        if not messages:
+            return "There are no earlier messages in this session yet."
+
+        transcript = self._history_transcript(messages, limit=30)
+        try:
+            summary, _ = await self.llm_service.invoke_text(
+                system_prompt=(
+                    "You summarize a chat session for the user. Use only the provided transcript. "
+                    "Mention the main requests, what was answered, unresolved issues, and useful next steps. "
+                    "If there is no connected database context, still summarize the conversation itself."
+                ),
+                user_prompt=f"Session transcript, oldest to newest:\n{transcript}",
+                preferred_provider=provider_preference,
+                max_output_tokens=350,
+            )
+            if summary.strip():
+                return summary.strip()
+        except Exception as exc:
+            logger.warning("Falling back to local session summary because LLM summary failed: %s", exc)
+
+        return self._fallback_session_summary(messages)
+
+    async def _last_messages_reply(
+        self,
+        messages: list[dict],
+        *,
+        count: int,
+        provider_preference: str | None,
+    ) -> str:
+        if not messages:
+            return "There are no earlier messages in this session yet."
+
+        selected = messages[-count:]
+        transcript = self._history_transcript(selected, limit=count)
+        try:
+            explanation, _ = await self.llm_service.invoke_text(
+                system_prompt=(
+                    "Explain the selected previous chat messages plainly. Use only the provided messages. "
+                    "Keep the answer concise and identify who said each important thing."
+                ),
+                user_prompt=f"Selected previous messages, oldest to newest:\n{transcript}",
+                preferred_provider=provider_preference,
+                max_output_tokens=260,
+            )
+            if explanation.strip():
+                return explanation.strip()
+        except Exception as exc:
+            logger.warning("Falling back to local last-message explanation because LLM explanation failed: %s", exc)
+
+        label = "message" if count == 1 else "messages"
+        lines = [f"Here are the last {len(selected)} previous {label} in this session:"]
+        for index, message in enumerate(selected, start=1):
+            role = self._history_role_label(message)
+            content = self._truncate_text(str(message.get("content") or "").strip(), 700)
+            lines.append(f"{index}. {role}: {content}")
+        return "\n".join(lines)
+
+    def _history_transcript(self, messages: list[dict], *, limit: int) -> str:
+        selected = messages[-limit:]
+        lines = []
+        for index, message in enumerate(selected, start=1):
+            role = self._history_role_label(message)
+            content = self._truncate_text(str(message.get("content") or "").strip(), 900)
+            if content:
+                lines.append(f"{index}. {role}: {content}")
+        return "\n".join(lines)
+
+    def _history_role_label(self, message: dict) -> str:
+        return "User" if message.get("role") == "user" else "Assistant"
+
+    def _fallback_session_summary(self, messages: list[dict]) -> str:
+        user_messages = [str(item.get("content") or "").strip() for item in messages if item.get("role") == "user"]
+        assistant_messages = [
+            str(item.get("content") or "").strip() for item in messages if item.get("role") == "assistant"
+        ]
+        lines = [
+            f"This session has {len(messages)} previous messages: {len(user_messages)} from you and {len(assistant_messages)} from me."
+        ]
+        if user_messages:
+            lines.append("Recent things you asked:")
+            for item in user_messages[-5:]:
+                lines.append(f"- {self._truncate_text(item, 220)}")
+        if assistant_messages:
+            lines.append("Recent things I answered:")
+            for item in assistant_messages[-5:]:
+                lines.append(f"- {self._truncate_text(item, 220)}")
+        return "\n".join(lines)
 
     def _is_data_source_question(self, question: str) -> bool:
         normalized = question.lower().translate(str.maketrans("", "", string.punctuation))
@@ -982,7 +1145,7 @@ class ChatService:
                 "(for example 'now give me it for Nexora' or 'same for budget'), keep the latest request's "
                 "measure, time grain, visualization intent, and comparison shape, then replace only the changed filter. "
                 "Do not copy old facts unless they are needed to form the new query.\n"
-                f"{self._truncate_text(state['memory_context'], 1800)}"
+                f"{self._truncate_text(state['memory_context'], MAX_MEMORY_CONTEXT_CHARS)}"
             )
 
         # --- Tier 3A: Inject previous validation errors on retry ---
@@ -1107,7 +1270,7 @@ class ChatService:
             f"Rows:\n{self._json_for_prompt(limited_rows)}"
         )
         if state.get("memory_context"):
-            user_prompt += f"\n\n{self._truncate_text(state['memory_context'], 1800)}"
+            user_prompt += f"\n\n{self._truncate_text(state['memory_context'], MAX_MEMORY_CONTEXT_CHARS)}"
         try:
             payload, provider = await self.llm_service.invoke_json(
                 system_prompt=prompt,
@@ -1257,7 +1420,7 @@ class ChatService:
             f"Rows:\n{self._json_for_prompt(limited_rows)}"
         )
         if memory_context:
-            prompt += f"\n\n{self._truncate_text(memory_context, 1800)}"
+            prompt += f"\n\n{self._truncate_text(memory_context, MAX_MEMORY_CONTEXT_CHARS)}"
         if sanity_warnings:
             prompt += (
                 "\n\nWarnings about this result (mention relevant caveats in your answer): "

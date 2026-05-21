@@ -82,7 +82,9 @@ class LlmService:
                             user_prompt=user_prompt,
                         )
                         return self._coerce_schema_payload(payload, schema), provider
-                    except Exception:
+                    except Exception as exc:
+                        if self._is_rate_limit_error(exc):
+                            raise
                         logger.warning(
                             "Structured output failed for provider %s. Falling back to JSON extraction.",
                             provider,
@@ -107,13 +109,15 @@ class LlmService:
                         return self._coerce_schema_payload(repaired, schema), provider
                     raise
             except Exception as exc:  # pragma: no cover - network/provider path
-                logger.exception("LLM JSON invocation failed for provider %s", provider)
+                await self._record_provider_failure(provider, exc, estimated_tokens)
                 last_error = exc
                 continue
 
         if last_error:
             if isinstance(last_error, ValueError) and "invalid JSON" in str(last_error):
                 raise ValueError("The model returned malformed structured output.") from last_error
+            if self._is_rate_limit_error(last_error):
+                raise ValueError("All configured LLM providers are currently rate-limited.") from last_error
             raise ValueError(f"LLM request failed: {last_error}") from last_error
         if selected_provider:
             raise ValueError(self._rate_limit_message(selected_provider))
@@ -152,11 +156,13 @@ class LlmService:
                 content = self._extract_text(result.content)
                 return content, provider
             except Exception as exc:  # pragma: no cover - network/provider path
-                logger.exception("LLM invocation failed for provider %s", provider)
+                await self._record_provider_failure(provider, exc, estimated_tokens)
                 last_error = exc
                 continue
 
         if last_error:
+            if self._is_rate_limit_error(last_error):
+                raise ValueError("All configured LLM providers are currently rate-limited.") from last_error
             raise ValueError(f"LLM request failed: {last_error}") from last_error
         if selected_provider:
             raise ValueError(self._rate_limit_message(selected_provider))
@@ -200,13 +206,15 @@ class LlmService:
                     yield provider, content
                 return
             except Exception as exc:  # pragma: no cover - network/provider path
-                logger.exception("LLM streaming failed for provider %s", provider)
+                await self._record_provider_failure(provider, exc, estimated_tokens)
                 if emitted_content:
                     raise ValueError(f"LLM request failed: {exc}") from exc
                 last_error = exc
                 continue
 
         if last_error:
+            if self._is_rate_limit_error(last_error):
+                raise ValueError("All configured LLM providers are currently rate-limited.") from last_error
             raise ValueError(f"LLM request failed: {last_error}") from last_error
         if selected_provider:
             raise ValueError(self._rate_limit_message(selected_provider))
@@ -252,6 +260,59 @@ class LlmService:
     def _rate_limit_message(self, provider: str) -> str:
         return f"Selected LLM provider {self._provider_label(provider)} is currently rate-limited."
 
+    async def _record_provider_failure(self, provider: str, exc: Exception, estimated_tokens: int) -> None:
+        if not self._is_rate_limit_error(exc):
+            logger.exception("LLM request failed for provider %s", provider)
+            return
+
+        retry_seconds = self._retry_after_seconds(exc) or 60.0
+        exhausted_daily_tokens = self._is_daily_token_limit_error(exc)
+        await self.budget_service.mark_rate_limited(
+            provider,
+            estimated_tokens=estimated_tokens,
+            cooldown_seconds=retry_seconds,
+            exhausted_daily_tokens=exhausted_daily_tokens,
+        )
+        logger.warning(
+            "Provider %s rate-limited; cooling down for %.0f seconds. %s",
+            provider,
+            retry_seconds,
+            self._rate_limit_summary(exc),
+        )
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return "ratelimit" in text or "rate limit" in text or "429" in text
+
+    def _is_daily_token_limit_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "tokens per day" in text or "tpd" in text
+
+    def _retry_after_seconds(self, exc: Exception) -> float | None:
+        text = str(exc).lower()
+        match = re.search(r"try again in\s+([0-9.]+)\s*ms", text)
+        if match:
+            return max(1.0, float(match.group(1)) / 1000)
+
+        total = 0.0
+        matched = False
+        for value, unit in re.findall(r"([0-9.]+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)\b", text):
+            matched = True
+            amount = float(value)
+            if unit.startswith("h"):
+                total += amount * 3600
+            elif unit.startswith("m"):
+                total += amount * 60
+            else:
+                total += amount
+        return total if matched else None
+
+    def _rate_limit_summary(self, exc: Exception) -> str:
+        text = " ".join(str(exc).split())
+        if len(text) <= 240:
+            return text
+        return f"{text[:237].rstrip()}..."
+
     def _build_model(self, provider: str, max_output_tokens: int):
         timeout = self.settings.llm_timeout_seconds
         if provider == "deepseek":
@@ -274,6 +335,7 @@ class LlmService:
             groq_api_key=str(slot["api_key"]),
             temperature=0.1,
             timeout=timeout,
+            max_retries=0,
             max_tokens=max_output_tokens,
         )
 
