@@ -45,6 +45,7 @@ async def init_db() -> None:
                             "numDimensions": settings.memory_embedding_dimensions,
                             "similarity": "cosine",
                         },
+                        {"type": "filter", "path": "embedding_model"},
                         {"type": "filter", "path": "user_id"},
                         {"type": "filter", "path": "session_id"},
                     ]

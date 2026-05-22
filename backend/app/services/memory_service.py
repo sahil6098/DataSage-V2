@@ -1,6 +1,4 @@
-import hashlib
-import math
-import re
+from functools import lru_cache
 from typing import Any
 
 from bson import ObjectId
@@ -16,12 +14,20 @@ CONTEXT_QUESTION_CHAR_LIMIT = 320
 CONTEXT_ANSWER_CHAR_LIMIT = 900
 
 
+@lru_cache(maxsize=4)
+def _load_sentence_transformer(model_name: str) -> Any:
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
 class SessionMemoryService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.db = get_database()
         self.collection = self.db.chat_vectors
         self.dimensions = self.settings.memory_embedding_dimensions
+        self.embedding_model_name = self.settings.memory_embedding_model
 
     async def remember_turn(
         self,
@@ -48,6 +54,7 @@ class SessionMemoryService:
                 "answer": answer_text,
                 "content": content,
                 "embedding": self.embed(content),
+                "embedding_model": self.embedding_model_name,
                 "created_at": now,
             }
         )
@@ -105,20 +112,30 @@ class SessionMemoryService:
         )
 
     def embed(self, text: str) -> list[float]:
-        vector = [0.0] * self.dimensions
-        tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
-        features = tokens + [f"{tokens[i]} {tokens[i + 1]}" for i in range(max(0, len(tokens) - 1))]
+        normalized_text = " ".join(text.split())
+        if not normalized_text:
+            return [0.0] * self.dimensions
 
-        for feature in features:
-            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-            bucket = int.from_bytes(digest[:4], "big") % self.dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[bucket] += sign
-
-        norm = math.sqrt(sum(value * value for value in vector))
-        if not norm:
-            return vector
-        return [round(value / norm, 6) for value in vector]
+        try:
+            model = _load_sentence_transformer(self.embedding_model_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to load SentenceTransformer model '{self.embedding_model_name}'. "
+                "Install backend requirements and make sure the model is available locally or downloadable from Hugging Face."
+            ) from exc
+        embedding = model.encode(
+            normalized_text,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        vector = [round(float(value), 6) for value in embedding.tolist()]
+        if len(vector) != self.dimensions:
+            raise ValueError(
+                f"SentenceTransformer model '{self.embedding_model_name}' returned {len(vector)} dimensions, "
+                f"but MEMORY_EMBEDDING_DIMENSIONS is set to {self.dimensions}."
+            )
+        return vector
 
     async def _recall_with_vector_search(
         self,
@@ -136,7 +153,11 @@ class SessionMemoryService:
                     "queryVector": query_vector,
                     "numCandidates": max(25, limit * 8),
                     "limit": limit,
-                    "filter": {"user_id": user_id, "session_id": session_id},
+                    "filter": {
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "embedding_model": self.embedding_model_name,
+                    },
                 }
             },
             {"$project": {"question": 1, "answer": 1, "created_at": 1, "score": {"$meta": "vectorSearchScore"}}},
@@ -156,7 +177,11 @@ class SessionMemoryService:
     ) -> list[dict[str, Any]]:
         cursor = (
             self.collection.find(
-                {"user_id": user_id, "session_id": session_id},
+                {
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "embedding_model": self.embedding_model_name,
+                },
                 {"question": 1, "answer": 1, "embedding": 1, "created_at": 1},
             )
             .sort("created_at", -1)
