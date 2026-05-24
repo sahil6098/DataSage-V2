@@ -15,7 +15,12 @@ from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import Flowable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.db.mongo import get_database
+
+
+MIN_REPORT_USER_MESSAGES = 4
+logger = get_logger(__name__)
 
 
 class ReportChart(Flowable):
@@ -135,22 +140,36 @@ class ReportService:
         messages = session.get("messages", [])
         if not messages:
             raise ValueError("This chat has no messages to report yet.")
+        user_message_count = sum(1 for message in messages if message.get("role") == "user")
+        if user_message_count < MIN_REPORT_USER_MESSAGES:
+            remaining = MIN_REPORT_USER_MESSAGES - user_message_count
+            suffix = "" if remaining == 1 else "s"
+            raise ValueError(f"Send {remaining} more message{suffix} before generating a report.")
 
-        narrative = await self._generate_openrouter_narrative(session)
+        narrative = await self._generate_report_narrative(session)
         pdf = self._build_pdf(session=session, narrative=narrative)
         filename = self._safe_filename(str(session.get("title") or "datasage-report")) + ".pdf"
         return pdf, filename
 
-    async def _generate_openrouter_narrative(self, session: dict) -> dict[str, Any]:
+    async def _generate_report_narrative(self, session: dict) -> dict[str, Any]:
         if not self.settings.openrouter_report_api_key:
-            raise ValueError("OPENROUTER_REPORT_API_KEY is not configured.")
+            return self._fallback_narrative(session)
+        try:
+            narrative = await self._generate_openrouter_narrative(session)
+        except Exception as exc:
+            logger.warning("Falling back to local report narrative because OpenRouter report generation failed: %s", exc)
+            return self._fallback_narrative(session)
+        return self._normalize_narrative(narrative, session)
 
+    async def _generate_openrouter_narrative(self, session: dict) -> dict[str, Any]:
         transcript = self._compact_transcript(session.get("messages", []))
         visuals = self._visual_summaries(session.get("messages", []))
         system_prompt = (
-            "You generate concise analytics report content as JSON only. "
+            "You generate concise analytics report content as JSON only. Do not copy the transcript as Q/A. "
             "Return keys: title, executive_summary, key_findings, recommendations, limitations. "
             "key_findings and recommendations must be arrays of short strings. "
+            "The executive_summary must be a real paragraph explaining what happened in the session, "
+            "what was analyzed, what outcomes were produced, and what issues remain. "
             "Base the report only on the supplied chat transcript and visualization summaries."
         )
         user_prompt = (
@@ -180,6 +199,74 @@ class ReportService:
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
         return self._extract_json(content)
+
+    def _fallback_narrative(self, session: dict) -> dict[str, Any]:
+        messages = session.get("messages", [])
+        user_messages = [str(message.get("content") or "").strip() for message in messages if message.get("role") == "user"]
+        assistant_messages = [
+            str(message.get("content") or "").strip() for message in messages if message.get("role") == "assistant"
+        ]
+        visuals = self._visual_summaries(messages)
+        title = str(session.get("title") or "DataSage Report")
+
+        summary_bits = [
+            f"This report summarizes a DataSage session with {len(user_messages)} user requests and {len(assistant_messages)} assistant responses.",
+            "The conversation focused on the user's data-analysis workflow, generated answers, charts or dashboard requests, and follow-up issues raised during the session.",
+        ]
+        if visuals:
+            summary_bits.append(f"The session produced {len(visuals)} visualization-ready result set{'s' if len(visuals) != 1 else ''}.")
+
+        findings = []
+        for question in user_messages[-6:]:
+            findings.append(f"User explored: {self._truncate(question, 180)}")
+        for answer in assistant_messages[-4:]:
+            findings.append(f"Assistant outcome: {self._truncate(answer, 200)}")
+        if visuals:
+            for visual in visuals[:3]:
+                findings.append(
+                    f"Visualization captured: {self._truncate(str(visual.get('title') or 'Untitled visualization'), 160)}"
+                )
+
+        return self._normalize_narrative(
+            {
+                "title": title,
+                "executive_summary": " ".join(summary_bits),
+                "key_findings": findings[:10],
+                "recommendations": [
+                    "Review the generated findings against the source data before sharing externally.",
+                    "Ask follow-up questions with exact metrics, tables, companies, or periods where deeper analysis is needed.",
+                    "Regenerate the report after the session includes final validated charts and conclusions.",
+                ],
+                "limitations": [
+                    "This report is based only on the saved chat transcript and visualization payloads.",
+                    "If an analysis failed or was rate-limited, its final answer may be incomplete in the report.",
+                ],
+            },
+            session,
+        )
+
+    def _normalize_narrative(self, narrative: dict[str, Any], session: dict) -> dict[str, Any]:
+        title = str(narrative.get("title") or session.get("title") or "DataSage Report")
+        executive_summary = str(narrative.get("executive_summary") or "").strip()
+        if not executive_summary:
+            executive_summary = "This report summarizes the main analysis requests, responses, and follow-up items from the chat session."
+
+        def listify(value: Any, fallback: str) -> list[str]:
+            if isinstance(value, list):
+                items = [str(item).strip() for item in value if str(item).strip()]
+            elif isinstance(value, str) and value.strip():
+                items = [value.strip()]
+            else:
+                items = []
+            return items or [fallback]
+
+        return {
+            "title": title,
+            "executive_summary": executive_summary,
+            "key_findings": listify(narrative.get("key_findings"), "No key findings were captured."),
+            "recommendations": listify(narrative.get("recommendations"), "Continue the analysis with a more specific follow-up question."),
+            "limitations": listify(narrative.get("limitations"), "The report only uses information saved in this chat session."),
+        }
 
     def _build_pdf(self, *, session: dict, narrative: dict[str, Any]) -> bytes:
         buffer = io.BytesIO()

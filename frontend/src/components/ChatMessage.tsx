@@ -516,9 +516,42 @@ function readTitle(value: unknown): string | undefined {
   return undefined;
 }
 
-function toLabel(value: unknown, index: number) {
-  if (value === null || value === undefined || value === "") return `Item ${index + 1}`;
+function compactDisplayValue(value: unknown, index = 0): string {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "number") return formatMetric(value);
+  if (typeof value === "string" || typeof value === "boolean") return String(value);
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) {
+    const parts = value.map((item, itemIndex) => compactDisplayValue(item, itemIndex)).filter(Boolean);
+    return parts.length ? parts.slice(0, 3).join(", ") : `Item ${index + 1}`;
+  }
+  if (isRecord(value)) {
+    const preferredKeys = ["name", "title", "label", "category", "segment", "group", "status", "type", "method", "month", "date", "year"];
+    for (const key of preferredKeys) {
+      const nested = value[key];
+      const display = compactDisplayValue(nested, index);
+      if (display) return display;
+    }
+
+    if (value._id !== undefined && value._id !== value) {
+      const display = compactDisplayValue(value._id, index);
+      if (display) return display;
+    }
+
+    const entries = Object.entries(value)
+      .map(([key, item]) => {
+        const display = compactDisplayValue(item, index);
+        return display ? `${humanizeFieldName(key)}: ${display}` : "";
+      })
+      .filter(Boolean);
+    return entries.length ? entries.slice(0, 3).join(", ") : `Item ${index + 1}`;
+  }
   return String(value);
+}
+
+function toLabel(value: unknown, index: number) {
+  const label = compactDisplayValue(value, index).trim();
+  return label || `Item ${index + 1}`;
 }
 
 function toNumber(value: unknown): number | null {
@@ -791,7 +824,7 @@ function toChartNumber(value: unknown): number | null {
 function makeDataSet(label: string, values: unknown[]): DataSageDataset {
   return {
     label: humanizeFieldName(label || "Value"),
-    data: values.map((value) => toChartNumber(value) ?? 0),
+    data: values.map((value) => toChartNumber(value) ?? Number.NaN),
   };
 }
 
@@ -806,6 +839,12 @@ function isTimeColumnName(columnName: string) {
 function findLabelKey(keys: string[], rows: Array<Record<string, unknown>>) {
   const timeKey = keys.find(isTimeColumnName);
   if (timeKey) return timeKey;
+
+  const numericKeys = keys.filter((key) => rows.some((row) => toChartNumber(row[key]) !== null));
+  const identifierKey = keys.find((key) => isIdentifierColumn(key));
+  if (identifierKey && numericKeys.some((key) => key !== identifierKey)) {
+    return identifierKey;
+  }
 
   const semanticKey = keys.find(
     (key) =>
@@ -837,6 +876,14 @@ function findLabelColumnIndex(columns: string[], rows: unknown[][]) {
   const timeIndex = columns.findIndex(isTimeColumnName);
   if (timeIndex >= 0) return timeIndex;
 
+  const numericIndexes = columns
+    .map((_, index) => index)
+    .filter((index) => rows.some((row) => toChartNumber(row[index]) !== null));
+  const identifierIndex = columns.findIndex(isIdentifierColumn);
+  if (identifierIndex >= 0 && numericIndexes.some((index) => index !== identifierIndex)) {
+    return identifierIndex;
+  }
+
   const semanticIndex = columns.findIndex(
     (columnName, columnIndex) =>
       !isIdentifierColumn(columnName) &&
@@ -859,8 +906,10 @@ function normalizeRecordRows(rows: Array<Record<string, unknown>>): NormalizedCh
   const keys = Object.keys(rows[0]);
   const labelKey = findLabelKey(keys, rows);
   const numericKeys = keys.filter((key) => key !== labelKey && rows.some((row) => toChartNumber(row[key]) !== null));
-  const valueKeys = numericKeys.length ? numericKeys : keys.filter((key) => key !== labelKey);
+  const valueKeys = numericKeys;
   const labels = labelKey ? rows.map((row, index) => toLabel(row[labelKey], index)) : rows.map((_, index) => `Item ${index + 1}`);
+
+  if (!valueKeys.length) return emptyNormalizedChartData();
 
   return {
     labels,
@@ -880,11 +929,11 @@ function normalizeSqlRows(columns: unknown[], rows: unknown[][]): NormalizedChar
   const numericIndexes = columnNames
     .map((_, index) => index)
     .filter((index) => index !== labelIndex && rows.some((row) => toChartNumber(row[index]) !== null));
-  const valueIndexes = numericIndexes.length
-    ? numericIndexes
-    : columnNames.map((_, index) => index).filter((index) => index !== labelIndex);
+  const valueIndexes = numericIndexes;
   const labels =
     labelIndex >= 0 ? rows.map((row, index) => toLabel(row[labelIndex], index)) : rows.map((_, index) => `Item ${index + 1}`);
+
+  if (!valueIndexes.length) return emptyNormalizedChartData();
 
   return {
     labels,
@@ -908,7 +957,9 @@ function normalizeChartData(rawData: unknown): NormalizedChartData {
       labels = rawData.labels.map((label, index) => toLabel(label, index));
       datasets = rawData.datasets
         .filter(isRecord)
-        .map((dataset, index) => makeDataSet(typeof dataset.label === "string" ? dataset.label : `Series ${index + 1}`, toArray(dataset.data)));
+        .map((dataset, index) => makeDataSet(typeof dataset.label === "string" ? dataset.label : `Series ${index + 1}`, toArray(dataset.data)))
+        .filter((dataset) => dataset.data.some((value) => Number.isFinite(value)));
+      if (!datasets.length) return emptyNormalizedChartData();
       return {
         labels,
         datasets,
@@ -922,6 +973,7 @@ function normalizeChartData(rawData: unknown): NormalizedChartData {
     if (isRecord(rawData) && Array.isArray(rawData.labels) && Array.isArray(rawData.values)) {
       labels = rawData.labels.map((label, index) => toLabel(label, index));
       datasets = [makeDataSet("Value", rawData.values)];
+      if (!datasets[0].data.some((value) => Number.isFinite(value))) return emptyNormalizedChartData();
       return { labels, datasets, columnNames: ["label", "value"], numericColumnNames: ["value"], rowCount: labels.length };
     }
 
@@ -1009,6 +1061,18 @@ function mapPreferredChartType(chartType: string | undefined): DataSageChartType
   return null;
 }
 
+function resolveInitialChartType(
+  normalized: NormalizedChartData,
+  userQuery: string,
+  preferredChartType?: DataSageChartType | null,
+): DataSageChartType {
+  const inferred = preferredChartType || selectChartType(normalized, userQuery);
+  if (inferred === "threeDBar" && normalized.labels.length > 12) {
+    return "horizontalBar";
+  }
+  return inferred;
+}
+
 function plotlyTracesToRawData(traces: PlotlyTrace[]) {
   const pieTrace = traces.find((trace) => trace.type?.toLowerCase() === "pie");
   if (pieTrace) {
@@ -1055,7 +1119,7 @@ function plotlyTracesToRawData(traces: PlotlyTrace[]) {
 }
 
 function hasChartableData(data: NormalizedChartData) {
-  return Boolean(data.labels.length && data.datasets.some((dataset) => dataset.data.length));
+  return Boolean(data.labels.length && data.datasets.some((dataset) => dataset.data.some((value) => Number.isFinite(value))));
 }
 
 function cloneChartData(data: NormalizedChartData): NormalizedChartData {
@@ -1254,6 +1318,7 @@ function buildChartOptions(chartType: RenderChartType, itemCount: number): Chart
   const usesScales = ["bar", "threeDBar", "line", "horizontalBar", "histogram", "groupedBar"].includes(chartType);
   const isHorizontal = chartType === "horizontalBar";
   const isLine = chartType === "line";
+  const truncateTick = (value: string) => (value.length > 18 ? `${value.slice(0, 17)}...` : value);
   const plugins = {
     tooltip: getTooltipConfig(),
     legend: {
@@ -1276,6 +1341,9 @@ function buildChartOptions(chartType: RenderChartType, itemCount: number): Chart
   return {
     responsive: true,
     maintainAspectRatio: false,
+    layout: {
+      padding: chartType === "threeDBar" ? { top: 26, right: 34, bottom: 10, left: 8 } : { top: 12, right: 14, bottom: 8, left: 4 },
+    },
     indexAxis: isHorizontal ? "y" : "x",
     aspectRatio: getChartAspectRatio(chartType, itemCount),
     animation: {
@@ -1306,13 +1374,30 @@ function buildChartOptions(chartType: RenderChartType, itemCount: number): Chart
       ? {
           x: {
             grid: { color: "rgba(15,23,42,0.08)" },
-            ticks: { color: "#64748b" },
+            ticks: {
+              color: "#64748b",
+              autoSkip: !isHorizontal && itemCount > 10,
+              maxTicksLimit: isHorizontal ? undefined : 10,
+              maxRotation: isHorizontal ? 0 : 38,
+              minRotation: isHorizontal ? 0 : itemCount > 8 ? 28 : 0,
+              callback(value) {
+                const label = isHorizontal ? formatAxisTick(value) : this.getLabelForValue(Number(value));
+                return truncateTick(String(label));
+              },
+            },
             beginAtZero: isHorizontal,
+            grace: isHorizontal ? "8%" : undefined,
           },
           y: {
             grid: { color: "rgba(15,23,42,0.08)" },
-            ticks: { color: "#64748b" },
+            ticks: {
+              color: "#64748b",
+              callback(value) {
+                return isHorizontal ? truncateTick(this.getLabelForValue(Number(value))) : formatAxisTick(value);
+              },
+            },
             beginAtZero: !isHorizontal,
+            grace: isHorizontal ? undefined : "12%",
           },
         }
       : {},
@@ -1416,7 +1501,7 @@ function renderTable(rows: Array<Record<string, unknown>>, title = "Data preview
             {rows.map((row, ri) => (
               <tr key={ri}>
                 {columns.map((col) => (
-                  <td key={col}>{String(row[col] ?? "")}</td>
+                  <td key={col}>{compactDisplayValue(row[col])}</td>
                 ))}
               </tr>
             ))}
@@ -1464,7 +1549,7 @@ function DataSageChart({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const normalized = normalizeChartData(rawData);
-  const selectedChartType = preferredChartType || selectChartType(normalized, userQuery);
+  const selectedChartType = resolveInitialChartType(normalized, userQuery, preferredChartType);
   const [viewOverride, setViewOverride] = useState<DataSageChartType | null>(null);
   const effectiveChartType = viewOverride || selectedChartType;
   const frameHeight = getChartFrameHeight(effectiveChartType, normalized.labels.length);
@@ -1595,7 +1680,7 @@ function Visualization({ vizData, messageContent }: { vizData: string; messageCo
                     {tableRows.map((row, ri) => (
                       <tr key={ri}>
                         {columns.map((col) => (
-                          <td key={col}>{String(row[col] ?? "")}</td>
+                          <td key={col}>{compactDisplayValue(row[col])}</td>
                         ))}
                       </tr>
                     ))}

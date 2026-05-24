@@ -812,6 +812,7 @@ export default function DataSourcePreview({
   const fieldCount = previewFields.length || columns.length;
   const chartModel = buildPreviewChart(rows, selectedTableMeta?.fields || []);
   const hasChart = Boolean(chartModel && chartModel.data.length);
+  const [chartReady, setChartReady] = useState(false);
   const previewSampleLabel =
     totalRowCount > rows.length
       ? `Using the first ${numberFormatter.format(rows.length)} preview rows of ${numberFormatter.format(totalRowCount)} total rows.`
@@ -823,6 +824,17 @@ export default function DataSourcePreview({
   const currentTableDescription = selectedTableMeta ? (schemaContextDraft.tableDescriptions[selectedTableMeta.name] || "") : "";
   const currentFieldDescriptions = selectedTableMeta ? (schemaContextDraft.fieldDescriptions[selectedTableMeta.name] || {}) : {};
   const databaseDescriptionLength = schemaContextDraft.databaseDescription.trim().length;
+
+  useEffect(() => {
+    if (!isOpen || !hasChart) {
+      setChartReady(false);
+      return;
+    }
+
+    setChartReady(false);
+    const frame = window.requestAnimationFrame(() => setChartReady(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, [isOpen, hasChart, selectedTable, rows.length]);
 
   if (!sourceConfig) {
     return null;
@@ -847,92 +859,94 @@ export default function DataSourcePreview({
         </div>
 
         <div className="preview-chart-frame" style={{ height: getChartHeight(chartModel) }}>
-          <ResponsiveContainer width="100%" height="100%">
-            {chartModel.kind === "line" ? (
-              <LineChart data={chartModel.data} margin={{ top: 12, right: 12, left: -18, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dbe4f0" />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fill: "#60708a", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  minTickGap={18}
-                />
-                <YAxis
-                  tick={{ fill: "#60708a", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  label={{ value: chartModel.yAxisLabel, angle: -90, position: "insideLeft", fill: "#60708a" }}
-                />
-                <Tooltip
-                  formatter={(value) => numberFormatter.format(Number(value ?? 0))}
-                  labelFormatter={(label, payload) => String(payload?.[0]?.payload?.fullLabel || label)}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="value"
-                  stroke={CHART_COLORS[0]}
-                  strokeWidth={3}
-                  dot={{ fill: CHART_COLORS[0], strokeWidth: 0, r: 4 }}
-                  activeDot={{ r: 6 }}
-                />
-              </LineChart>
-            ) : chartModel.kind === "vertical-bar" ? (
-              <BarChart data={chartModel.data} margin={{ top: 12, right: 12, left: -18, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dbe4f0" />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fill: "#60708a", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  minTickGap={12}
-                />
-                <YAxis
-                  tick={{ fill: "#60708a", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  label={{ value: chartModel.yAxisLabel, angle: -90, position: "insideLeft", fill: "#60708a" }}
-                />
-                <Tooltip
-                  formatter={(value) => numberFormatter.format(Number(value ?? 0))}
-                  labelFormatter={(label, payload) => String(payload?.[0]?.payload?.fullLabel || label)}
-                />
-                <Bar dataKey="value" radius={[12, 12, 0, 0]}>
-                  {chartModel.data.map((point, index) => (
-                    <Cell key={point.fullLabel} fill={CHART_COLORS[index % CHART_COLORS.length]} />
-                  ))}
-                </Bar>
-              </BarChart>
-            ) : (
-              <BarChart data={chartModel.data} layout="vertical" margin={{ top: 12, right: 12, left: 36, bottom: 8 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dbe4f0" />
-                <XAxis
-                  type="number"
-                  tick={{ fill: "#60708a", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                  label={{ value: chartModel.xAxisLabel, position: "insideBottom", offset: -4, fill: "#60708a" }}
-                />
-                <YAxis
-                  type="category"
-                  dataKey="label"
-                  width={176}
-                  tick={{ fill: "#60708a", fontSize: 12 }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <Tooltip
-                  formatter={(value) => numberFormatter.format(Number(value ?? 0))}
-                  labelFormatter={(label, payload) => String(payload?.[0]?.payload?.fullLabel || label)}
-                />
-                <Bar dataKey="value" radius={[0, 12, 12, 0]}>
-                  {chartModel.data.map((point, index) => (
-                    <Cell key={point.fullLabel} fill={CHART_COLORS[index % CHART_COLORS.length]} />
-                  ))}
-                </Bar>
-              </BarChart>
-            )}
-          </ResponsiveContainer>
+          {chartReady ? (
+            <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1} debounce={80}>
+              {chartModel.kind === "line" ? (
+                <LineChart data={chartModel.data} margin={{ top: 12, right: 12, left: -18, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dbe4f0" />
+                  <XAxis
+                    dataKey="label"
+                    tick={{ fill: "#60708a", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                    minTickGap={18}
+                  />
+                  <YAxis
+                    tick={{ fill: "#60708a", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                    label={{ value: chartModel.yAxisLabel, angle: -90, position: "insideLeft", fill: "#60708a" }}
+                  />
+                  <Tooltip
+                    formatter={(value) => numberFormatter.format(Number(value ?? 0))}
+                    labelFormatter={(label, payload) => String(payload?.[0]?.payload?.fullLabel || label)}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="value"
+                    stroke={CHART_COLORS[0]}
+                    strokeWidth={3}
+                    dot={{ fill: CHART_COLORS[0], strokeWidth: 0, r: 4 }}
+                    activeDot={{ r: 6 }}
+                  />
+                </LineChart>
+              ) : chartModel.kind === "vertical-bar" ? (
+                <BarChart data={chartModel.data} margin={{ top: 12, right: 12, left: -18, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dbe4f0" />
+                  <XAxis
+                    dataKey="label"
+                    tick={{ fill: "#60708a", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                    minTickGap={12}
+                  />
+                  <YAxis
+                    tick={{ fill: "#60708a", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                    label={{ value: chartModel.yAxisLabel, angle: -90, position: "insideLeft", fill: "#60708a" }}
+                  />
+                  <Tooltip
+                    formatter={(value) => numberFormatter.format(Number(value ?? 0))}
+                    labelFormatter={(label, payload) => String(payload?.[0]?.payload?.fullLabel || label)}
+                  />
+                  <Bar dataKey="value" radius={[12, 12, 0, 0]}>
+                    {chartModel.data.map((point, index) => (
+                      <Cell key={point.fullLabel} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              ) : (
+                <BarChart data={chartModel.data} layout="vertical" margin={{ top: 12, right: 12, left: 36, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dbe4f0" />
+                  <XAxis
+                    type="number"
+                    tick={{ fill: "#60708a", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                    label={{ value: chartModel.xAxisLabel, position: "insideBottom", offset: -4, fill: "#60708a" }}
+                  />
+                  <YAxis
+                    type="category"
+                    dataKey="label"
+                    width={176}
+                    tick={{ fill: "#60708a", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                  />
+                  <Tooltip
+                    formatter={(value) => numberFormatter.format(Number(value ?? 0))}
+                    labelFormatter={(label, payload) => String(payload?.[0]?.payload?.fullLabel || label)}
+                  />
+                  <Bar dataKey="value" radius={[0, 12, 12, 0]}>
+                    {chartModel.data.map((point, index) => (
+                      <Cell key={point.fullLabel} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              )}
+            </ResponsiveContainer>
+          ) : null}
         </div>
 
         <p className="preview-chart-note">{previewSampleLabel}</p>

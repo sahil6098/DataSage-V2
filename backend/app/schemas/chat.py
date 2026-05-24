@@ -78,7 +78,7 @@ class SqlAnalysisPlan(BaseModel):
 
 
 class MongoAnalysisPlan(BaseModel):
-    collection: str = Field(min_length=1)
+    collection: str | None = None
     pipeline: list[dict[str, Any]] = Field(default_factory=list)
     chart_type: ChartType | None = None
     notes: str | None = None

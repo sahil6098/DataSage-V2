@@ -18,6 +18,7 @@ import DataSourcePreview, { type ConnectedSourceConfig } from "@/components/Data
 const API = API_BASE_PATH;
 const MODEL_STORAGE_KEY = "llm_provider";
 const STREAM_FRAME_MS = 16;
+const MIN_REPORT_USER_MESSAGES = 4;
 
 type LlmProvider = "groq" | "deepseek";
 
@@ -127,6 +128,14 @@ export default function ChatSessionPage() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const messageBudget = getMessageBudgetState(input);
+  const userMessageCount = messages.filter((message) => message.role === "user").length;
+  const canGenerateReport = userMessageCount >= MIN_REPORT_USER_MESSAGES;
+  const reportDisabled = reportLoading || loading || !canGenerateReport;
+  const reportTitle = canGenerateReport
+    ? "Generate report PDF"
+    : `Send ${MIN_REPORT_USER_MESSAGES - userMessageCount} more message${
+        MIN_REPORT_USER_MESSAGES - userMessageCount === 1 ? "" : "s"
+      } to generate a report`;
 
   const markConnectionInactive = () => {
     setIsConnected(false);
@@ -563,7 +572,7 @@ export default function ChatSessionPage() {
   };
 
   const handleDownloadReport = async () => {
-    if (!sessionId || reportLoading || messages.length === 0) {
+    if (!sessionId || reportDisabled) {
       return;
     }
 
@@ -657,8 +666,8 @@ export default function ChatSessionPage() {
                     type="button"
                     className="btn-secondary"
                     onClick={() => void handleDownloadReport()}
-                    disabled={reportLoading || messages.length === 0}
-                    title={messages.length === 0 ? "Start the chat before generating a report" : "Generate report PDF"}
+                    disabled={reportDisabled}
+                    title={reportTitle}
                   >
                     <FileText size={16} />
                     {reportLoading ? "Creating PDF" : "Generate report"}
@@ -749,6 +758,19 @@ null
                                 </span>
                                 <span className="action-chip-copy">Upload file</span>
                               </button>
+                              <button
+                                type="button"
+                                className="action-chip cursor-report"
+                                onClick={() => void handleDownloadReport()}
+                                disabled={reportDisabled}
+                                title={reportTitle}
+                              >
+                                <span className="action-chip-glow" />
+                                <span className="action-chip-icon">
+                                  <FileText size={14} />
+                                </span>
+                                <span className="action-chip-copy">Generate report</span>
+                              </button>
                             </>
                           )}
                           {sourceConfigured ? (
@@ -824,17 +846,12 @@ null
                               })}
                             </div>
                           </div>
-                          {!sourceConfigured && (
-                            <span className={`message-budget-pill ${messageBudget.overLimit ? "over-limit" : ""}`}>
-                              Message budget {messageBudget.estimatedTokens}/{MAX_MESSAGE_TOKENS} tokens
-                            </span>
-                          )}
                         </div>
 
                         <button
                           type="submit"
                           className="icon-button send-btn"
-                          disabled={loading || !input.trim() || messageBudget.overLimit}
+                          disabled={loading || !input.trim()}
                           aria-label="Send message"
                         >
                           <ArrowUp strokeWidth={3} size={22} />

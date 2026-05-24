@@ -1490,6 +1490,13 @@ button {
 .preview-chart-frame {
   width: 100%;
   min-width: 0;
+  min-height: 240px;
+  position: relative;
+  overflow: hidden;
+}
+
+.preview-chart-frame .recharts-responsive-container {
+  min-height: 1px;
 }
 
 .preview-chart-note {
@@ -1801,6 +1808,13 @@ button {
 
 .action-chip:active {
   transform: translateY(0);
+}
+
+.action-chip:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
 }
 
 .action-chip-glow {
@@ -2811,6 +2825,7 @@ button {
   z-index: 1;
   width: 100%;
   min-width: 0;
+  overflow: visible;
 }
 
 .chart-canvas {

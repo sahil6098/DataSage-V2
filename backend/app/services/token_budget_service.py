@@ -21,6 +21,16 @@ class DailyCounter:
     tokens: int = 0
 
 
+@dataclass(slots=True)
+class ProviderBudgetStatus:
+    provider: str
+    requests_last_minute: int
+    tokens_last_minute: int
+    requests_today: int
+    tokens_today: int
+    cooldown_until: float
+
+
 class TokenBudgetService:
     def __init__(self) -> None:
         settings = get_settings()
@@ -95,6 +105,20 @@ class TokenBudgetService:
             if budget.tokens_per_day > 0 and daily.tokens + estimated_tokens > budget.tokens_per_day:
                 return False
             return True
+
+    async def status(self, provider: str) -> ProviderBudgetStatus:
+        async with self.lock:
+            now = time()
+            self._cleanup(provider, now)
+            daily = self._get_daily(provider, now)
+            return ProviderBudgetStatus(
+                provider=provider,
+                requests_last_minute=len(self.request_windows[provider]),
+                tokens_last_minute=sum(token_count for _, token_count in self.token_windows[provider]),
+                requests_today=daily.count,
+                tokens_today=daily.tokens,
+                cooldown_until=self.cooldowns[provider],
+            )
 
     async def mark_rate_limited(
         self,

@@ -115,12 +115,20 @@ class Settings(BaseSettings):
         for index in range(1, 11):
             key = getattr(self, f"groq_api_key_{index}", None)
             model = getattr(self, f"groq_model_{index}", None) or self.groq_model
-            if not key or "YOUR_KEY" in key:
+            normalized_key = key.strip() if key else ""
+            lowered_key = normalized_key.lower()
+            if (
+                not normalized_key
+                or "your" in lowered_key
+                or "replace" in lowered_key
+                or not normalized_key.startswith("gsk_")
+            ):
                 continue
-            slots.append({"slot": index, "api_key": key, "model": model})
+            slots.append({"slot": index, "api_key": normalized_key, "model": model})
 
-        if self.groq_api_key and not slots and "YOUR_KEY" not in self.groq_api_key:
-            slots.append({"slot": 1, "api_key": self.groq_api_key, "model": self.groq_model})
+        fallback_key = self.groq_api_key.strip() if self.groq_api_key else ""
+        if fallback_key and not slots and fallback_key.startswith("gsk_"):
+            slots.append({"slot": 1, "api_key": fallback_key, "model": self.groq_model})
         return slots
 
     @property

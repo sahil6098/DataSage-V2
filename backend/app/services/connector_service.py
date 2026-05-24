@@ -1,4 +1,7 @@
 import asyncio
+import copy
+import re
+from difflib import get_close_matches
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -60,10 +63,11 @@ class ConnectorService:
             raise ValueError(str(exc)) from exc
 
         schema = await self._build_live_schema(parsed, None)
+        database_name = schema.get("database_name") or parsed.database_name
         selected_tables = [table["name"] for table in schema["tables"]]
         data_source = {
             "type": parsed.source_type,
-            "database_name": parsed.database_name,
+            "database_name": database_name,
             "connection_uri_encrypted": encrypt_text(parsed.normalized_uri),
             "connection_uri_masked": parsed.masked_uri,
             "file_name": None,
@@ -81,13 +85,17 @@ class ConnectorService:
         saved_source_id = None
         if payload.save_to_library:
             saved_source_id = await self._upsert_saved_source(user_id, parsed)
+            await self.db.saved_sources.update_one(
+                {"_id": ObjectId(saved_source_id)},
+                {"$set": {"database_name": database_name, "display_name": database_name}},
+            )
             data_source["saved_source_id"] = saved_source_id
 
         await self.session_service.update_data_source(user_id, session_id, data_source)
         logger.info("Connected %s source for user %s session %s", parsed.source_type, user_id, session_id)
         return {
             "source_type": parsed.source_type,
-            "database_name": parsed.database_name,
+            "database_name": database_name,
             "connection_uri": parsed.masked_uri,
             "saved_source_id": saved_source_id,
         }
@@ -106,10 +114,11 @@ class ConnectorService:
             display_name=source["display_name"],
         )
         schema = await self._build_live_schema(parsed, None)
+        database_name = schema.get("database_name") or parsed.database_name
         selected_tables = [table["name"] for table in schema["tables"]]
         data_source = {
             "type": parsed.source_type,
-            "database_name": parsed.database_name,
+            "database_name": database_name,
             "connection_uri_encrypted": source["encrypted_uri"],
             "connection_uri_masked": parsed.masked_uri,
             "file_name": None,
@@ -126,11 +135,18 @@ class ConnectorService:
         await self.session_service.update_data_source(user_id, session_id, data_source)
         await self.db.saved_sources.update_one(
             {"_id": source["_id"]},
-            {"$set": {"updated_at": ist_now(), "last_connected_at": ist_now()}},
+            {
+                "$set": {
+                    "database_name": database_name,
+                    "display_name": database_name,
+                    "updated_at": ist_now(),
+                    "last_connected_at": ist_now(),
+                }
+            },
         )
         return {
             "source_type": parsed.source_type,
-            "database_name": parsed.database_name,
+            "database_name": database_name,
             "connection_uri": parsed.masked_uri,
             "saved_source_id": saved_source_id,
         }
@@ -170,6 +186,16 @@ class ConnectorService:
         if not data_source:
             raise ValueError("No data source connected to this session.")
 
+        cached_schema = data_source.get("schema_cache")
+        if cached_schema and cached_schema.get("tables"):
+            schema = self._apply_context(copy.deepcopy(cached_schema), data_source)
+            if schema.get("database_name") and data_source.get("saved_source_id"):
+                await self.db.saved_sources.update_one(
+                    {"_id": ObjectId(data_source["saved_source_id"])},
+                    {"$set": {"database_name": schema["database_name"], "display_name": schema["database_name"]}},
+                )
+            return SchemaResponse(**schema)
+
         source_type = data_source["type"]
         if source_type in {"mongodb", "postgresql"}:
             parsed = ParsedConnection(
@@ -186,6 +212,13 @@ class ConnectorService:
             schema = await self._build_file_schema(file_path, data_source)
 
         data_source["schema_cache"] = schema
+        if schema.get("database_name"):
+            data_source["database_name"] = schema["database_name"]
+            if data_source.get("saved_source_id"):
+                await self.db.saved_sources.update_one(
+                    {"_id": ObjectId(data_source["saved_source_id"])},
+                    {"$set": {"database_name": schema["database_name"], "display_name": schema["database_name"]}},
+                )
         data_source["updated_at"] = ist_now()
         await self.session_service.update_data_source(user_id, session_id, data_source)
         return SchemaResponse(**schema)
@@ -339,8 +372,35 @@ class ConnectorService:
             try:
                 database = client[database_name]
                 database.command("ping")
+                collection_names = database.list_collection_names()
+                if not collection_names:
+                    available_databases = [
+                        name
+                        for name in client.list_database_names()
+                        if name not in {"admin", "config", "local"}
+                    ]
+                    suggested = get_close_matches(database_name, available_databases, n=1, cutoff=0.82)
+                    if suggested:
+                        database_name_to_use = suggested[0]
+                        logger.info(
+                            "Using close MongoDB database name match '%s' for requested '%s'.",
+                            database_name_to_use,
+                            database_name,
+                        )
+                        database = client[database_name_to_use]
+                        collection_names = database.list_collection_names()
+                    else:
+                        database_name_to_use = database_name
+                else:
+                    database_name_to_use = database_name
+
+                if not collection_names:
+                    available_text = ", ".join(available_databases[:10]) if "available_databases" in locals() else ""
+                    hint = f" Available databases: {available_text}." if available_text else ""
+                    raise ValueError(f"MongoDB database '{database_name}' has no collections or was not found.{hint}")
+
                 tables = []
-                for collection_name in database.list_collection_names():
+                for collection_name in collection_names:
                     collection = database[collection_name]
                     sample_documents = list(collection.find({}, limit=5))
                     row_count = collection.estimated_document_count()
@@ -356,7 +416,7 @@ class ConnectorService:
                     )
                 return {
                     "source_type": "mongodb",
-                    "database_name": database_name,
+                    "database_name": database_name_to_use,
                     "database_description": None,
                     "selected_table_count": len(tables),
                     "tables": tables,
@@ -549,7 +609,7 @@ class ConnectorService:
         if not isinstance(pipeline, list):
             raise ValueError("MongoDB analysis pipeline must be a JSON array.")
 
-        pipeline = self._normalize_mongodb_pipeline(pipeline, row_limit)
+        pipeline = self._normalize_mongodb_pipeline(pipeline, row_limit, data_source, collection_name)
         compiled_query["pipeline"] = pipeline
 
         connection_uri = decrypt_text(data_source["connection_uri_encrypted"])
@@ -569,7 +629,13 @@ class ConnectorService:
         except PyMongoError as exc:
             raise ValueError(self._mongodb_error_message(exc)) from exc
 
-    def _normalize_mongodb_pipeline(self, pipeline: list, row_limit: int) -> list[dict]:
+    def _normalize_mongodb_pipeline(
+        self,
+        pipeline: list,
+        row_limit: int,
+        data_source: dict | None = None,
+        collection_name: str | None = None,
+    ) -> list[dict]:
         normalized: list[dict] = []
         forbidden_stages = {"$out", "$merge"}
         stage_operator_names = {
@@ -604,6 +670,8 @@ class ConnectorService:
             "vectorSearch",
         }
 
+        self._validate_mongodb_collection(data_source, collection_name)
+
         for stage in pipeline:
             if not isinstance(stage, dict):
                 raise ValueError("MongoDB aggregation stages must be JSON objects.")
@@ -635,11 +703,262 @@ class ConnectorService:
                         value = max(1, min(int(value), row_limit))
                     except (TypeError, ValueError) as exc:
                         raise ValueError("MongoDB $limit stage must be a positive integer.") from exc
-                normalized.append({key: value})
+                normalized.append({key: self._sanitize_mongodb_stage(key, value)})
 
         if not any("$limit" in stage for stage in normalized):
             normalized.append({"$limit": row_limit})
+        self._validate_mongodb_pipeline_fields(normalized, data_source, collection_name)
         return normalized
+
+    def _validate_mongodb_collection(self, data_source: dict | None, collection_name: str | None) -> None:
+        if not data_source or not collection_name:
+            return
+        known = {
+            str(table.get("name"))
+            for table in data_source.get("schema_cache", {}).get("tables", [])
+            if table.get("name")
+        }
+        selected = {str(name) for name in data_source.get("selected_tables", []) if name}
+        if known and collection_name not in known:
+            raise ValueError(f"MongoDB collection '{collection_name}' is not present in the connected schema.")
+        if selected and collection_name not in selected:
+            raise ValueError(f"MongoDB collection '{collection_name}' is not selected for analysis.")
+
+    def _sanitize_mongodb_stage(self, stage_operator: str, value: Any) -> Any:
+        if stage_operator == "$sort":
+            if not isinstance(value, dict):
+                raise ValueError("MongoDB $sort stage must be an object.")
+            sanitized_sort = {}
+            for field, direction in value.items():
+                if not isinstance(field, str) or field.startswith("$"):
+                    raise ValueError("MongoDB $sort fields must be plain field names.")
+                try:
+                    sort_direction = int(direction)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("MongoDB $sort directions must be 1 or -1.") from exc
+                if sort_direction not in {-1, 1}:
+                    raise ValueError("MongoDB $sort directions must be 1 or -1.")
+                sanitized_sort[field] = sort_direction
+            return sanitized_sort
+        if stage_operator == "$unwind":
+            return self._sanitize_mongodb_unwind_stage(value)
+        if stage_operator in {"$match", "$limit", "$skip", "$sample", "$lookup", "$unset"}:
+            return value
+        return self._sanitize_mongodb_expression(value)
+
+    def _sanitize_mongodb_unwind_stage(self, value: Any) -> Any:
+        if isinstance(value, str):
+            if not value.startswith("$") or value in {"$", "$$"}:
+                raise ValueError("MongoDB $unwind path must be a field reference like '$items'.")
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("MongoDB $unwind stage must be a field path string or an options object.")
+
+        repaired: dict[str, Any] = {}
+        allowed_options = {"path", "includeArrayIndex", "preserveNullAndEmptyArrays"}
+        option_aliases = {
+            "$path": "path",
+            "$includeArrayIndex": "includeArrayIndex",
+            "$preserveNullAndEmptyArrays": "preserveNullAndEmptyArrays",
+        }
+        for raw_key, raw_value in value.items():
+            key = option_aliases.get(str(raw_key), str(raw_key))
+            if key not in allowed_options:
+                raise ValueError(f"MongoDB $unwind option '{raw_key}' is not supported.")
+            if key == "path":
+                if not isinstance(raw_value, str) or not raw_value.startswith("$") or raw_value in {"$", "$$"}:
+                    raise ValueError("MongoDB $unwind path must be a field reference like '$items'.")
+                repaired[key] = raw_value
+            elif key == "includeArrayIndex":
+                if not isinstance(raw_value, str) or raw_value.startswith("$"):
+                    raise ValueError("MongoDB $unwind includeArrayIndex must be a plain field name.")
+                repaired[key] = raw_value
+            else:
+                repaired[key] = bool(raw_value)
+
+        if "path" not in repaired:
+            raise ValueError("MongoDB $unwind options must include a path.")
+        return repaired
+
+    def _sanitize_mongodb_expression(self, value: Any) -> Any:
+        if isinstance(value, list):
+            return [self._sanitize_mongodb_expression(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        if len(value) == 1:
+            raw_key, raw_value = next(iter(value.items()))
+            key = str(raw_key)
+            item = self._sanitize_mongodb_expression(raw_value)
+            if key == "$dateFromString" and isinstance(item, dict):
+                return {key: self._sanitize_mongodb_date_from_string(item)}
+            if key == "$cond":
+                return {key: self._sanitize_mongodb_cond_expression(item)}
+            if key == "$concat" and isinstance(item, list):
+                return {key: [self._mongodb_string_expression(operand) for operand in item]}
+            if key == "$divide" and isinstance(item, list) and len(item) == 2:
+                numerator = self._mongodb_numeric_expression(item[0])
+                denominator = self._mongodb_numeric_expression(item[1])
+                return {
+                    "$cond": [
+                        {"$in": [denominator, [0, None]]},
+                        None,
+                        {"$divide": [numerator, denominator]},
+                    ]
+                }
+            if key in {"$sum", "$avg"}:
+                return {key: self._mongodb_numeric_expression(item)}
+            if key in {"$add", "$multiply", "$subtract"} and isinstance(item, list):
+                return {key: [self._mongodb_numeric_expression(operand) for operand in item]}
+
+        sanitized: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            item = self._sanitize_mongodb_expression(raw_value)
+            if key == "$dateFromString" and isinstance(item, dict):
+                item = self._sanitize_mongodb_date_from_string(item)
+            elif key == "$cond":
+                item = self._sanitize_mongodb_cond_expression(item)
+            elif key == "$concat" and isinstance(item, list):
+                item = [self._mongodb_string_expression(operand) for operand in item]
+            elif key in {"$sum", "$avg"}:
+                item = self._mongodb_numeric_expression(item)
+            elif key in {"$add", "$multiply", "$subtract"} and isinstance(item, list):
+                item = [self._mongodb_numeric_expression(operand) for operand in item]
+            sanitized[key] = item
+        return sanitized
+
+    def _sanitize_mongodb_date_from_string(self, value: dict[str, Any]) -> dict[str, Any]:
+        item = dict(value)
+        if "dateFormat" in item and "format" not in item:
+            logger.warning("Repairing MongoDB $dateFromString option 'dateFormat' to 'format'.")
+            item["format"] = item.pop("dateFormat")
+
+        if item.get("format") is None or item.get("format") == "":
+            item.pop("format", None)
+
+        date_string = item.get("dateString")
+        if isinstance(date_string, str):
+            month_match = re.fullmatch(r"(\d{4})-(\d{1,2})", date_string.strip())
+            year_match = re.fullmatch(r"(\d{4})", date_string.strip())
+            if month_match:
+                year, month = month_match.groups()
+                item["dateString"] = f"{year}-{int(month):02d}-01"
+            elif year_match:
+                item["dateString"] = f"{year_match.group(1)}-01-01"
+            elif date_string.startswith("$"):
+                date_string_expr = self._mongodb_string_expression(date_string)
+                item["dateString"] = {
+                    "$cond": [
+                        {"$regexMatch": {"input": date_string_expr, "regex": r"^\d{4}-\d{1,2}$"}},
+                        {"$concat": [date_string_expr, "-01"]},
+                        date_string_expr,
+                    ]
+                }
+        item.setdefault("onError", None)
+        item.setdefault("onNull", None)
+        return item
+
+    def _sanitize_mongodb_cond_expression(self, value: Any) -> Any:
+        if isinstance(value, list):
+            if len(value) != 3:
+                raise ValueError("MongoDB $cond expressions must contain exactly 3 arguments.")
+            return value
+        if isinstance(value, dict):
+            missing = {"if", "then", "else"} - set(value)
+            if missing:
+                raise ValueError("MongoDB $cond expressions must include if, then, and else.")
+            return value
+        raise ValueError("MongoDB $cond expression must be an array or object.")
+
+    def _mongodb_numeric_expression(self, value: Any) -> Any:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.startswith("$"):
+            return {"$convert": {"input": value, "to": "double", "onError": None, "onNull": None}}
+        if isinstance(value, dict):
+            return {"$convert": {"input": self._sanitize_mongodb_expression(value), "to": "double", "onError": None, "onNull": None}}
+        return value
+
+    def _mongodb_string_expression(self, value: Any) -> Any:
+        if isinstance(value, str) and not value.startswith("$"):
+            return value
+        if value is None:
+            return ""
+        return {
+            "$convert": {
+                "input": self._sanitize_mongodb_expression(value),
+                "to": "string",
+                "onError": "",
+                "onNull": "",
+            }
+        }
+
+    def _validate_mongodb_pipeline_fields(
+        self,
+        pipeline: list[dict],
+        data_source: dict | None,
+        collection_name: str | None,
+    ) -> None:
+        if not data_source or not collection_name:
+            return
+        schema_tables = data_source.get("schema_cache", {}).get("tables", [])
+        table = next((table for table in schema_tables if table.get("name") == collection_name), None)
+        if not table:
+            return
+        available = {str(field.get("name")).split(".")[0] for field in table.get("fields", []) if field.get("name")}
+        available.update({"_id", "id"})
+        for stage in pipeline:
+            if not stage:
+                continue
+            operator, value = next(iter(stage.items()))
+            refs = self._extract_mongodb_field_refs(value)
+            if operator in {"$match", "$sort"} and isinstance(value, dict):
+                refs.update(
+                    str(key).split(".")[0]
+                    for key in value
+                    if isinstance(key, str) and key and not key.startswith("$")
+                )
+            missing = sorted(ref for ref in refs if ref not in available)
+            if missing:
+                raise ValueError(
+                    "MongoDB analysis pipeline references fields not present in the selected collection: "
+                    + ", ".join(f"${field}" for field in missing[:5])
+                )
+            if operator in {"$project", "$addFields", "$set"} and isinstance(value, dict):
+                projected = {str(key).split(".")[0] for key in value if isinstance(key, str) and not key.startswith("$")}
+                if operator == "$project":
+                    available = projected | {"_id"}
+                else:
+                    available.update(projected)
+            elif operator == "$group" and isinstance(value, dict):
+                available = {"_id"} | {str(key) for key in value if isinstance(key, str) and key != "_id"}
+            elif operator == "$lookup" and isinstance(value, dict) and value.get("as"):
+                available.add(str(value["as"]).split(".")[0])
+            elif operator == "$unwind":
+                path = value.get("path") if isinstance(value, dict) else value
+                if isinstance(path, str) and path.startswith("$"):
+                    available.add(path.lstrip("$").split(".")[0])
+
+    def _extract_mongodb_field_refs(self, value: Any) -> set[str]:
+        refs: set[str] = set()
+
+        def _walk(obj: Any) -> None:
+            if isinstance(obj, str) and obj.startswith("$") and not obj.startswith("$$"):
+                field = obj.lstrip("$").split(".")[0]
+                if field and not field.startswith("$"):
+                    refs.add(field)
+            elif isinstance(obj, dict):
+                for key, nested in obj.items():
+                    if key in {"$literal", "$dateFromString"} and isinstance(nested, str):
+                        continue
+                    _walk(nested)
+            elif isinstance(obj, list):
+                for nested in obj:
+                    _walk(nested)
+
+        _walk(value)
+        return refs
 
     def _infer_mongodb_collection(self, data_source: dict) -> str | None:
         selected = [str(name) for name in data_source.get("selected_tables", []) if name]

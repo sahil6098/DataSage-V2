@@ -9,7 +9,8 @@ import {
   Send,
   Sparkles,
   UploadCloud,
-  ArrowUp
+  ArrowUp,
+  FileText
 } from "lucide-react";
 import api from "@/lib/api";
 import { getMessageBudgetState, MAX_MESSAGE_TOKENS } from "@/lib/message-budget";
@@ -214,15 +215,19 @@ export default function ChatDashboard() {
                             </span>
                             <span className="action-chip-copy">Upload file</span>
                           </button>
-                          <span className={`message-budget-pill ${messageBudget.overLimit ? "over-limit" : ""}`}>
-                            Message budget {messageBudget.estimatedTokens}/{MAX_MESSAGE_TOKENS} tokens
-                          </span>
+                          <button type="button" className="action-chip cursor-report" onClick={() => console.log('Generate report clicked')}>
+                            <span className="action-chip-glow" />
+                            <span className="action-chip-icon">
+                              <FileText size={14} />
+                            </span>
+                            <span className="action-chip-copy">Generate report</span>
+                          </button>
                         </div>
 
                         <button
                           type="submit"
                           className="icon-button"
-                          disabled={!input.trim() || messageBudget.overLimit}
+                          disabled={!input.trim()}
                           aria-label="Send prompt"
                         >
                           <ArrowUp strokeWidth={3} size={22} />

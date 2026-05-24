@@ -1,7 +1,9 @@
 import ast
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Iterable
+from time import time
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -28,6 +30,8 @@ class LlmService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.budget_service = TokenBudgetService()
+        self._groq_cursor = 0
+        self._cursor_lock = asyncio.Lock()
 
     def available_providers(self) -> list[str]:
         """Return providers in priority order: Groq slots, then DeepSeek."""
@@ -55,7 +59,7 @@ class LlmService:
         max_output_tokens: int = 500,
     ) -> tuple[dict, str]:
         selected_provider = self._normalize_provider(preferred_provider)
-        providers = self._provider_order(preferred_provider)
+        providers = await self._provider_order(preferred_provider)
         if not providers:
             raise ValueError("No LLM provider is configured. Add a Groq key slot or a HuggingFace API key.")
 
@@ -85,6 +89,15 @@ class LlmService:
                     except Exception as exc:
                         if self._is_rate_limit_error(exc):
                             raise
+                        failed_generation = self._extract_failed_generation(exc)
+                        if failed_generation:
+                            try:
+                                return self._coerce_schema_payload(
+                                    self._extract_json(failed_generation),
+                                    schema,
+                                ), provider
+                            except ValueError:
+                                pass
                         logger.warning(
                             "Structured output failed for provider %s. Falling back to JSON extraction.",
                             provider,
@@ -132,7 +145,7 @@ class LlmService:
         max_output_tokens: int = 500,
     ) -> tuple[str, str]:
         selected_provider = self._normalize_provider(preferred_provider)
-        providers = self._provider_order(preferred_provider)
+        providers = await self._provider_order(preferred_provider)
         if not providers:
             raise ValueError("No LLM provider is configured. Add a Groq key slot or a HuggingFace API key.")
 
@@ -177,7 +190,7 @@ class LlmService:
         max_output_tokens: int = 500,
     ) -> AsyncIterator[tuple[str, str]]:
         selected_provider = self._normalize_provider(preferred_provider)
-        providers = self._provider_order(preferred_provider)
+        providers = await self._provider_order(preferred_provider)
         if not providers:
             raise ValueError("No LLM provider is configured. Add a Groq key slot or a HuggingFace API key.")
 
@@ -220,12 +233,16 @@ class LlmService:
             raise ValueError(self._rate_limit_message(selected_provider))
         raise ValueError("All configured LLM providers are currently rate-limited.")
 
-    def _provider_order(self, preferred_provider: str | None) -> list[str]:
+    async def _provider_order(self, preferred_provider: str | None) -> list[str]:
         available = self._available_provider_candidates()
+        exact_provider = self._exact_provider(preferred_provider)
+        if exact_provider and exact_provider in available:
+            return [exact_provider] + [candidate for candidate in available if candidate != exact_provider]
+
         explicit_preferred = self._normalize_provider(preferred_provider)
         preferred = explicit_preferred or self._normalize_provider(self.settings.llm_default_provider)
         if not preferred:
-            return available
+            return await self._spread_groq_candidates(available)
         if preferred not in SUPPORTED_PROVIDERS:
             supported = ", ".join(sorted(self._provider_label(provider) for provider in SUPPORTED_PROVIDERS))
             raise ValueError(f"Unsupported LLM provider '{preferred_provider}'. Choose one of: {supported}.")
@@ -238,7 +255,52 @@ class LlmService:
             raise ValueError(
                 f"{self._provider_label(preferred)} is selected, but {key_name} is not configured on the backend."
             )
-        return preferred_candidates + [candidate for candidate in available if candidate not in preferred_candidates]
+        preferred_candidates = await self._spread_groq_candidates(preferred_candidates)
+        remaining = await self._spread_groq_candidates(
+            [candidate for candidate in available if candidate not in preferred_candidates]
+        )
+        return preferred_candidates + remaining
+
+    def _exact_provider(self, provider: str | None) -> str | None:
+        normalized = (provider or "").strip().lower()
+        if re.fullmatch(r"groq:\d+", normalized):
+            return normalized
+        return normalized if normalized == "deepseek" else None
+
+    async def _spread_groq_candidates(self, candidates: list[str]) -> list[str]:
+        groq_candidates = [candidate for candidate in candidates if candidate.startswith("groq:")]
+        if len(groq_candidates) <= 1:
+            return candidates
+
+        statuses = {
+            candidate: await self.budget_service.status(candidate)
+            for candidate in groq_candidates
+        }
+        async with self._cursor_lock:
+            start = self._groq_cursor % len(groq_candidates)
+            self._groq_cursor = (self._groq_cursor + 1) % len(groq_candidates)
+
+        rotated_groq = groq_candidates[start:] + groq_candidates[:start]
+        rotated_rank = {candidate: index for index, candidate in enumerate(rotated_groq)}
+        now = time()
+        rotated_groq = sorted(
+            rotated_groq,
+            key=lambda candidate: (
+                statuses[candidate].cooldown_until > now,
+                statuses[candidate].tokens_today,
+                statuses[candidate].tokens_last_minute,
+                statuses[candidate].requests_last_minute,
+                rotated_rank[candidate],
+            ),
+        )
+        ordered: list[str] = []
+        groq_iter = iter(rotated_groq)
+        for candidate in candidates:
+            if candidate.startswith("groq:"):
+                ordered.append(next(groq_iter))
+            else:
+                ordered.append(candidate)
+        return ordered
 
     def _available_provider_candidates(self) -> list[str]:
         candidates = [f"groq:{slot['slot']}" for slot in self.settings.groq_slots]
@@ -312,6 +374,27 @@ class LlmService:
         if len(text) <= 240:
             return text
         return f"{text[:237].rstrip()}..."
+
+    def _extract_failed_generation(self, exc: Exception) -> str | None:
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict) and isinstance(error.get("failed_generation"), str):
+                return error["failed_generation"]
+
+        text = str(exc)
+        marker = " - "
+        if marker in text:
+            maybe_payload = text.split(marker, 1)[1]
+            try:
+                payload = ast.literal_eval(maybe_payload)
+            except (SyntaxError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                error = payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("failed_generation"), str):
+                    return error["failed_generation"]
+        return None
 
     def _build_model(self, provider: str, max_output_tokens: int):
         timeout = self.settings.llm_timeout_seconds

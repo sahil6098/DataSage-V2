@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.errors import OperationFailure
 from pymongo.operations import SearchIndexModel
 
 from app.core.config import get_settings
@@ -52,6 +53,11 @@ async def init_db() -> None:
                 },
             )
         )
+    except OperationFailure as exc:
+        if exc.code == 68 or "already defined" in str(exc).lower() or "already exists" in str(exc).lower():
+            logger.info("MongoDB vector search index already exists: %s", settings.memory_vector_index_name)
+        else:
+            logger.info("MongoDB vector search index was not created automatically: %s", exc)
     except Exception as exc:
         logger.info("MongoDB vector search index was not created automatically: %s", exc)
     logger.info("Mongo indexes ensured.")

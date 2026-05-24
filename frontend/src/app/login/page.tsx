@@ -299,8 +299,6 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (!rive) return;
-    const inputs = rive.stateMachineInputs('Motion');
-    console.log('MOTION INPUTS:', inputs?.map(i => i.name));
     const canvas = document.querySelector('canvas');
     if (canvas) {
       canvas.style.background = 'transparent';
