@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.api.routers.auth import router as auth_router
 from app.api.routers.chat import router as chat_router
@@ -31,10 +31,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+
+# ── CORS must be the LAST middleware added so it runs FIRST ──────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],          # temporary wildcard — locks down after confirming fix
+    allow_credentials=False,      # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -42,6 +44,10 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    # Return a bare 200 for CORS preflight so CORSMiddleware can attach headers
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     request_id = request.headers.get("x-request-id") or str(uuid4())
     start = perf_counter()
     try:
