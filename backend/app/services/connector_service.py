@@ -888,7 +888,14 @@ class ConnectorService:
         if isinstance(value, str) and value.startswith("$"):
             return {"$convert": {"input": value, "to": "double", "onError": None, "onNull": None}}
         if isinstance(value, dict):
-            return {"$convert": {"input": self._sanitize_mongodb_expression(value), "to": "double", "onError": None, "onNull": None}}
+            sanitized = self._sanitize_mongodb_expression(value)
+            # If the expression is already a $convert to double, don't double-wrap
+            if "$convert" in sanitized and sanitized.get("$convert", {}).get("to") == "double":
+                return sanitized
+            return {"$convert": {"input": sanitized, "to": "double", "onError": None, "onNull": None}}
+        if isinstance(value, list):
+            # Lists in aggregation accumulator expressions (e.g., $sum [expr])
+            return [self._mongodb_numeric_expression(item) for item in value]
         return value
 
     def _mongodb_string_expression(self, value: Any) -> Any:
@@ -950,6 +957,13 @@ class ConnectorService:
                 path = value.get("path") if isinstance(value, dict) else value
                 if isinstance(path, str) and path.startswith("$"):
                     available.add(path.lstrip("$").split(".")[0])
+            elif operator in {"$replaceRoot", "$replaceWith"}:
+                # After $replaceRoot the available fields change completely;
+                # we cannot statically determine them, so allow everything.
+                available = None  # type: ignore[assignment]
+            if available is None:
+                # Once we lose field tracking (e.g. after $replaceRoot), skip further checks
+                break
 
     def _extract_mongodb_field_refs(self, value: Any) -> set[str]:
         refs: set[str] = set()
@@ -961,8 +975,14 @@ class ConnectorService:
                     refs.add(field)
             elif isinstance(obj, dict):
                 for key, nested in obj.items():
-                    if key in {"$literal", "$dateFromString"} and isinstance(nested, str):
+                    if key == "$literal":
+                        # $literal values are constants, skip entirely
                         continue
+                    if key == "$dateFromString" and isinstance(nested, str):
+                        # Bare string value for $dateFromString is a literal date, skip
+                        continue
+                    # For $dateFromString dict values, recurse into the
+                    # sub-keys (dateString may be a $field reference)
                     _walk(nested)
             elif isinstance(obj, list):
                 for nested in obj:
@@ -1011,6 +1031,9 @@ class ConnectorService:
 
     def _prepare_file_sql_query(self, data_source: dict, sql_query: str) -> str:
         query = sql_query
+        # Strip PostgreSQL-style public. schema prefix — DuckDB tables are registered directly
+        query = re.sub(r'\bpublic\."', '"', query, flags=re.IGNORECASE)
+        query = re.sub(r'\bpublic\.(?=[A-Za-z_])', '', query, flags=re.IGNORECASE)
         table_names = {
             str(table.get("name"))
             for table in data_source.get("schema_cache", {}).get("tables", [])
@@ -1036,10 +1059,13 @@ class ConnectorService:
         lowered = query.lower()
         if not lowered.startswith(("select", "with")):
             raise ValueError("Only read-only SQL queries are allowed.")
+        # Strip string literals before checking for forbidden keywords
+        # to prevent false positives (e.g. WHERE status = 'inserted')
+        literals_removed = re.sub(r"'(?:''|[^'])*'", " ", lowered)
         forbidden_keywords = {"insert", "update", "delete", "drop", "alter", "truncate", "create"}
         normalized_words = {
             fragment.strip("(),")
-            for fragment in lowered.replace("\n", " ").replace("\t", " ").split(" ")
+            for fragment in literals_removed.replace("\n", " ").replace("\t", " ").split(" ")
             if fragment.strip("(),")
         }
         if normalized_words.intersection(forbidden_keywords):

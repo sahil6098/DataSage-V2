@@ -20,18 +20,19 @@ from app.utils.time import ist_now
 logger = get_logger(__name__)
 
 
-MAX_PROMPT_CHARS = 6_000
-MAX_CONTEXT_TABLES = 6
-MAX_CONTEXT_FIELDS_PER_TABLE = 10
-MAX_CONTEXT_SAMPLE_CHARS = 60
-MAX_PROMPT_ROWS = 6
-MAX_PROMPT_FIELDS_PER_ROW = 10
-MAX_PROMPT_VALUE_CHARS = 160
-MAX_MEMORY_CONTEXT_CHARS = 2_500
-MAX_QUERY_RETRIES = 1
-MAX_PLAN_VALIDATION_RETRIES = 0
+MAX_PROMPT_CHARS = 8_000
+MAX_CONTEXT_TABLES = 10
+MAX_CONTEXT_FIELDS_PER_TABLE = 20
+MAX_CONTEXT_SAMPLE_CHARS = 80
+MAX_PROMPT_ROWS = 8
+MAX_PROMPT_FIELDS_PER_ROW = 12
+MAX_PROMPT_VALUE_CHARS = 200
+MAX_MEMORY_CONTEXT_CHARS = 3_000
+MAX_QUERY_RETRIES = 2
+MAX_PLAN_VALIDATION_RETRIES = 1
 
 SQL_KEYWORDS = {
+    # ── Standard SQL clauses & operators ──
     "select", "from", "where", "and", "or", "not", "in", "is", "null",
     "like", "between", "as", "on", "join", "left", "right", "inner",
     "outer", "cross", "group", "by", "order", "asc", "desc", "having",
@@ -45,6 +46,38 @@ SQL_KEYWORDS = {
     "fetch", "first", "next", "rows", "only", "percent", "ties",
     "current_date", "current_timestamp", "current_time", "date_trunc",
     "strftime", "strptime", "year", "month", "day",
+    # ── Standard SQL aggregate / scalar functions ──
+    "abs", "ceil", "ceiling", "floor", "round", "power", "sqrt", "mod",
+    "sign", "log", "ln", "exp", "greatest", "least",
+    "concat", "replace", "left", "right", "lpad", "rpad", "reverse",
+    "position", "charindex", "char_length", "character_length",
+    "string_agg", "group_concat", "listagg", "array_agg",
+    "bool_and", "bool_or", "every", "any_value",
+    # ── Date / time functions (shared) ──
+    "now", "age", "date_part", "date_diff", "datediff", "dateadd",
+    "date_add", "date_sub", "to_char", "to_date", "to_number",
+    "to_timestamp", "make_date", "make_timestamp",
+    "hour", "minute", "second", "week", "quarter", "dow", "doy", "epoch",
+    # ── DuckDB-specific functions ──
+    "try_cast", "typeof", "ifnull", "list_agg", "list",
+    "regexp_matches", "regexp_extract", "regexp_replace",
+    "struct_pack", "unnest", "generate_series", "range",
+    "string_split", "string_split_regex", "array_length",
+    "row", "filter", "columns", "exclude", "replace",
+    # ── PostgreSQL-specific functions ──
+    "json_agg", "jsonb_agg", "json_build_object", "jsonb_build_object",
+    "json_extract_path_text", "jsonb_extract_path_text",
+    "to_json", "to_jsonb",
+    "percentile_cont", "percentile_disc", "ntile",
+    "generate_series", "string_to_array", "array_to_string",
+    "regexp_match", "regexp_replace",
+    # ── Window / analytic extras ──
+    "first_value", "last_value", "nth_value", "cume_dist",
+    "percent_rank", "row_number",
+    # ── Type keywords ──
+    "int", "integer", "bigint", "smallint", "float", "double", "real",
+    "decimal", "numeric", "varchar", "text", "char", "boolean",
+    "serial", "uuid", "json", "jsonb", "bytea",
 }
 
 
@@ -227,6 +260,23 @@ class ChatService:
             execution_error = state.get("execution_error")
 
         if execution_error:
+            # Try LLM fallback for conversational / schema questions before giving error
+            fallback = await self._try_conversational_fallback(
+                question=question,
+                data_source=state["data_source"],
+                schema_context=state["schema_context"],
+                memory_context=state.get("memory_context", ""),
+                provider_preference=state.get("provider_used") or state.get("provider_preference"),
+            )
+            if fallback:
+                async for event in self._stream_prebuilt_reply(
+                    user_id=user_id,
+                    session_id=session_id,
+                    question=question,
+                    message=fallback,
+                ):
+                    yield event
+                return
             error_message = self._format_query_error(execution_error, state.get("validation_warnings"))
             async for event in self._stream_prebuilt_reply(
                 user_id=user_id,
@@ -239,6 +289,23 @@ class ChatService:
 
         rows = state.get("result_rows", [])
         if not rows:
+            # Try LLM fallback for questions that didn't yield data rows
+            fallback = await self._try_conversational_fallback(
+                question=question,
+                data_source=state["data_source"],
+                schema_context=state["schema_context"],
+                memory_context=state.get("memory_context", ""),
+                provider_preference=state.get("provider_used") or state.get("provider_preference"),
+            )
+            if fallback:
+                async for event in self._stream_prebuilt_reply(
+                    user_id=user_id,
+                    session_id=session_id,
+                    question=question,
+                    message=fallback,
+                ):
+                    yield event
+                return
             empty_message = "I could not find matching rows for that question in the connected source."
             if state.get("low_confidence"):
                 empty_message += (
@@ -326,7 +393,7 @@ class ChatService:
                 sanity_warnings=sanity_warnings,
             ),
             preferred_provider=state.get("provider_used") or state.get("provider_preference"),
-            max_output_tokens=360,
+            max_output_tokens=500,
         ):
             if not state.get("provider_used"):
                 state["provider_used"] = provider
@@ -737,6 +804,7 @@ class ChatService:
             "show last answer",
             "last answer",
         }
+        wants_resumption = self._wants_session_resumption(normalized)
         wants_history_lookup = self._wants_history_lookup(normalized)
         if not (
             wants_session_summary
@@ -744,11 +812,15 @@ class ChatService:
             or wants_last_question
             or wants_first_question
             or wants_last_answer
+            or wants_resumption
             or wants_history_lookup
         ):
             return None
 
         messages = await self.session_service.get_messages(user_id, session_id)
+        if wants_resumption:
+            return self._session_resumption_reply(messages)
+
         if wants_session_summary:
             return await self._session_summary_reply(messages, provider_preference=provider_preference)
 
@@ -778,6 +850,46 @@ class ChatService:
             if message.get("role") == "assistant":
                 return f"My previous answer was:\n\n{str(message.get('content') or '').strip()}"
         return "I do not see a previous answer in this session yet."
+
+    def _wants_session_resumption(self, normalized: str) -> bool:
+        """Detect phrases like 'continue from where we left off', 'pick up where we left off', etc."""
+        resumption_patterns = (
+            r"\b(continue|resume|pick up|carry on|go on|start from)\b.{0,20}\b(where|where we|from where)\b",
+            r"\b(where we left off|where i left off|from where we left|from before)\b",
+            r"\b(continue from|resume from|go back to)\b.{0,20}\b(last|previous|before|earlier)\b",
+            r"^(continue|resume|carry on|proceed|go on|let's continue|lets continue)$",
+        )
+        return any(re.search(pattern, normalized) for pattern in resumption_patterns)
+
+    def _session_resumption_reply(self, messages: list[dict]) -> str:
+        """Return a brief recap of recent session turns so the user can continue naturally."""
+        if not messages:
+            return (
+                "It looks like this is the start of our session — there is nothing to continue from yet. "
+                "Connect a data source and ask your first question to get started."
+            )
+
+        user_messages = [
+            str(m.get("content") or "").strip()
+            for m in messages
+            if m.get("role") == "user" and str(m.get("content") or "").strip()
+        ]
+        if not user_messages:
+            return "I don't see any earlier questions in this session yet. Go ahead and ask your first question."
+
+        recent_turns = self._history_transcript(messages[-12:], limit=12)
+        last_q = user_messages[-1]
+        lines = [
+            f"Welcome back! Here's a quick recap of where we left off in this session.",
+            "",
+            f"Your last question was: \"{self._truncate_text(last_q, 200)}\"",
+            "",
+            "Recent conversation:",
+            recent_turns,
+            "",
+            "Feel free to continue — ask your next question or refer back to any earlier analysis.",
+        ]
+        return "\n".join(lines)
 
     def _wants_history_lookup(self, normalized: str) -> bool:
         has_session_scope = bool(re.search(r"\b(this|current|our)\s+(session|chat|conversation)\b", normalized))
@@ -824,6 +936,13 @@ class ChatService:
             return None
         topic = re.sub(r"\b(you|me|please|pls)\b", " ", match.group(1))
         topic = " ".join(topic.split()).strip(" ?.")
+        # Strip trailing temporal qualifiers that are not part of the topic
+        topic = re.sub(
+            r"\s+\b(earlier|before|previously|recently|before|prior|ago|last time|in this session|in this chat)\b$",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        ).strip()
         return topic or None
 
     def _history_lookup_terms(self, topic: str) -> list[str]:
@@ -1489,6 +1608,104 @@ class ChatService:
         )
         yield {"type": "final", "payload": {"message": message, "viz_data": viz_data}}
 
+    # ------------------------------------------------------------------ #
+    #  Conversational fallback: handles questions that don't need a query #
+    # ------------------------------------------------------------------ #
+
+    async def _try_conversational_fallback(
+        self,
+        *,
+        question: str,
+        data_source: dict,
+        schema_context: str,
+        memory_context: str,
+        provider_preference: str | None,
+    ) -> str | None:
+        """
+        When the query pipeline fails or returns no rows, check if the question
+        is actually conversational/explanatory rather than analytical. If so,
+        answer it directly using LLM + schema context instead of forcing a query.
+        Returns an answer string or None if the question should remain a query failure.
+        """
+        # Only use fallback for clearly non-analytical or follow-up questions
+        if not self._is_conversational_or_followup(question):
+            return None
+
+        schema_summary = self._truncate_text(schema_context, 3000)
+        memory_snippet = self._truncate_text(memory_context, 1000) if memory_context else ""
+
+        system_prompt = (
+            "You are DataSage, a helpful data analysis assistant. "
+            "The user has a data source connected. You have access to the schema of that data source. "
+            "Answer the user's question conversationally using the schema context provided. "
+            "If the question asks what analyses are possible, suggest 3-5 specific, actionable questions "
+            "they can ask based on the actual tables and fields in the schema. "
+            "If the question is a follow-up or clarification from the conversation, answer it clearly. "
+            "Keep your answer concise and helpful. Do not fabricate data values. "
+            "Do not mention JSON, SQL, MongoDB, pipelines, or internal implementation details."
+        )
+        user_prompt = (
+            f"User question: {question}\n\n"
+            f"Connected data schema:\n{schema_summary}"
+        )
+        if memory_snippet:
+            user_prompt += f"\n\nRecent conversation context:\n{memory_snippet}"
+
+        try:
+            answer, _ = await self.llm_service.invoke_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                preferred_provider=provider_preference,
+                max_output_tokens=400,
+            )
+            answer = answer.strip()
+            if len(answer) > 30:
+                logger.info("Conversational fallback answered question: %s", question[:80])
+                return answer
+        except Exception as exc:
+            logger.warning("Conversational fallback LLM call failed: %s", exc)
+
+        return None
+
+    def _is_conversational_or_followup(self, question: str) -> bool:
+        """Return True if the question is likely conversational rather than a pure data query."""
+        normalized = question.lower().strip()
+
+        # Clear analytical signals — let the pipeline handle these, don't fallback
+        analytical_patterns = (
+            r"\b(count|total|sum|average|avg|max|min|top|bottom|rank|highest|lowest|how many|how much)\b",
+            r"\b(show me|give me|list|find|get|fetch|retrieve)\b.{0,30}\b(record|row|data|result|entry|entries)\b",
+            r"\b(group by|grouped by|by \w+|per \w+|for each|breakdown)\b",
+            r"\b(trend|over time|monthly|quarterly|yearly|by month|by year|last \d+)\b",
+            r"\b(compare|comparison|vs|versus|against|difference between)\b",
+            r"\b(filter|where|with status|having|greater than|less than|equal to)\b",
+        )
+        for pattern in analytical_patterns:
+            if re.search(pattern, normalized):
+                return False
+
+        # Conversational / exploratory signals — use LLM fallback
+        conversational_patterns = (
+            r"\b(what can (i|you)|what (should|could) i ask|what (questions|analysis) (can|could|should))\b",
+            r"\b(how (do|can|should) i|help me understand|explain|tell me about|what does this (data|table|field))\b",
+            r"\b(what (is|are) the|can you explain|give me an overview|summarize the (data|dataset|schema))\b",
+            r"\b(what (information|insights|patterns) (is|are|can))\b",
+            r"\b(analyze this|analyze the data|give me insights|what (do you|can you) see)\b",
+            r"\b(is there|are there|do (we|you) have|does (this|the) (data|table|collection))\b",
+            r"\b(previous|last|before|earlier|again|same|as before|that (question|analysis)|follow.?up)\b",
+            r"\b(which (table|collection|field|column)|what (table|field|column))\b",
+        )
+        for pattern in conversational_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        # Short questions (under 6 words) that aren't clearly analytical
+        words = normalized.split()
+        if len(words) <= 6:
+            return True
+
+        return False
+
     def _build_graph(self):
         graph = StateGraph(AnalysisState)
         graph.add_node("plan_query", self._plan_query)
@@ -1568,7 +1785,7 @@ class ChatService:
                 user_prompt=user_prompt,
                 preferred_provider=state.get("provider_preference"),
                 schema=MongoAnalysisPlan if source_type == "mongodb" else SqlAnalysisPlan,
-                max_output_tokens=280,
+                max_output_tokens=600,
             )
         except ValueError as exc:
             if self._is_structured_output_error(exc):
@@ -1735,7 +1952,7 @@ class ChatService:
                 user_prompt=user_prompt,
                 preferred_provider=state.get("provider_used") or state.get("provider_preference"),
                 schema=AnalysisAnswerPayload,
-                max_output_tokens=360,
+                max_output_tokens=500,
             )
         except ValueError as exc:
             if self._is_structured_output_error(exc):
@@ -1808,47 +2025,55 @@ class ChatService:
             return (
                 "You write safe MongoDB aggregation queries for analytics. "
                 "Return JSON only. Keys: collection, pipeline, chart_type, notes, confidence. "
-                "Rules: only use selected collections and fields from the schema context; "
-                "collection must exactly equal one Table name from the schema context; do not invent synonyms, "
-                "business categories, or likely collection names. If no exact collection fits, use collection null, "
-                "pipeline [], confidence 'low', and explain the missing collection in notes. "
-                "never use $out or $merge; add $limit only if needed for previews; "
-                "IMPORTANT: Before writing the pipeline, verify every field name you reference "
-                "exists in the schema context provided. If you cannot confidently answer the question "
-                "with the available schema, set confidence to 'low' and explain in notes what is missing. "
-                "Set confidence to 'high' when the schema clearly supports the query, 'medium' if some assumptions are made. "
-                "CRITICAL: When grouping by an ID field (like _id, category_id, product_id, user_id, etc.), "
-                "always use $lookup to join with the related collection and $project to include the human-readable "
-                "name/title/label field instead of showing raw IDs. The result rows must contain readable names, not IDs. "
-                "If there is a 'name', 'title', or 'label' field in the same collection, group by that instead of the ID. "
-                "If a field may contain numbers stored as strings, use $convert with onError/onNull or $toDouble before "
-                "using it in $sum, $avg, $divide, $subtract, $multiply, sorting, or comparisons. "
-                "For percentages, guard division by zero and non-numeric values. "
-                "Use $concat only with strings; convert numeric/date fields to strings first. "
-                "Use valid $cond syntax with exactly three array items or if/then/else object keys. "
-                "When parsing year-month values like 2021-01, append a day or provide a matching date format. "
-                "prefer aggregation answers suitable for dashboards and comparisons; "
-                "pipeline must be a valid JSON array of single-key stage objects like "
-                '{"$match": {"field": "value"}}, {"$group": {"_id": "$field", "count": {"$sum": 1}}}; '
-                "every aggregation stage operator must start with '$'."
+                "CRITICAL RULE 1: collection must exactly equal one Table name from the schema context — "
+                "do NOT invent collection names or use synonyms. If no exact collection matches, set "
+                "collection=null, pipeline=[], confidence='low', and explain in notes. "
+                "CRITICAL RULE 2: Only reference field names that EXIST in the schema context. "
+                "If a field is not listed in the schema, do NOT use it. Use only the actual field names shown. "
+                "CRITICAL RULE 3: Every pipeline stage must be a single-key object starting with '$'. "
+                "Valid stage operators: $match, $group, $project, $sort, $limit, $lookup, $unwind, $addFields, $count. "
+                "Never use $out or $merge. "
+                "CRITICAL RULE 4: For ambiguous or general questions (e.g. 'show me data', 'what is in here'), "
+                "pick the most relevant collection and produce a simple $group or $limit query to show representative data. "
+                "Do not refuse — always attempt a best-effort query. Set confidence='medium' and explain in notes. "
+                "When grouping by an ID field, prefer using a human-readable name/title field in the same collection instead. "
+                "If numeric fields may be stored as strings, use {$toDouble: '$field'} inside $sum/$avg. "
+                "For percentages always guard division by zero. "
+                "Use $concat only with strings; convert other types first with $toString. "
+                "pipeline must be a valid JSON array of single-key stage objects, e.g.: "
+                '[{"$match": {"status": "active"}}, {"$group": {"_id": "$category", "total": {"$sum": "$amount"}}}]. '
+                "Set confidence: 'high' when schema fully supports the query, 'medium' if some assumptions are made."
             )
-        dialect = "DuckDB SQL" if source_type in {"csv", "excel", "parquet"} else "PostgreSQL SQL"
-        return (
-            f"You write safe read-only {dialect} for analytics. "
+        is_file = source_type in {"csv", "excel", "parquet"}
+        dialect = "DuckDB SQL" if is_file else "PostgreSQL SQL"
+        base = (
+            f"You write safe read-only {dialect} SELECT queries for analytics. "
             "Return JSON only. Keys: query, chart_type, notes, confidence. "
-            "Rules: only SELECT or WITH queries; never modify data; "
-            "use exact table names from the schema context; do not invent synonyms or likely table names; "
-            "quote identifiers when needed; use only tables and columns in schema context; "
-            "IMPORTANT: Before writing the query, verify every column and table name you reference "
-            "exists in the schema context provided. If you cannot confidently answer the question "
-            "with the available schema, set confidence to 'low' and explain in notes what is missing. "
-            "Set confidence to 'high' when the schema clearly supports the query, 'medium' if some assumptions are made. "
-            "CRITICAL: When the result would show an ID column (like id, category_id, product_id, user_id, etc.), "
-            "always JOIN with the related table and SELECT the human-readable name/title/label column instead. "
-            "The result rows must contain readable names, not numeric or UUID IDs. "
-            "If there is a 'name', 'title', or 'label' column in the same table, select that instead of the ID. "
-            "keep results compact and analysis-ready; prefer grouped comparisons for finance questions."
+            "CRITICAL RULE 1: Only use table and column names that EXIST in the schema context provided. "
+            "Do not invent table names, column aliases, or synonyms not in the schema. "
+            "CRITICAL RULE 2: Only SELECT or WITH (CTE) queries. Never INSERT, UPDATE, DELETE, DROP, or CREATE. "
+            "CRITICAL RULE 3: Quote table/column identifiers with double-quotes when they contain spaces, "
+            "mixed case, or special characters. "
+            "CRITICAL RULE 4: For ambiguous or general questions, produce a reasonable best-effort SELECT "
+            "query grouping or counting the most relevant columns. Do not refuse — always attempt a query. "
+            "Set confidence='medium' and explain your approach in notes. "
+            "When the result would expose raw ID columns, JOIN with the related table to get readable names instead. "
+            "Keep results compact and analysis-ready. "
+            "Set confidence: 'high' when schema fully supports the query, 'medium' if assumptions are made, "
+            "'low' only if the schema fundamentally cannot support the request."
         )
+        if is_file:
+            base += (
+                " DuckDB-SPECIFIC RULES: "
+                "NEVER prefix table names with 'public.' — tables are registered directly by name without schema prefix. "
+                "Use TRY_CAST(x AS type) instead of CAST when the column may contain invalid/mixed values. "
+                "Do NOT use PostgreSQL-style '::type' casts. "
+                "Use double quotes for column names with spaces, mixed case, or special characters. "
+                "Do not reference information_schema or pg_catalog. "
+                "Use ILIKE for case-insensitive string matching. "
+                "Date functions: DATE_TRUNC('month', col), DATE_PART('year', col), STRFTIME(col, '%Y-%m')."
+            )
+        return base
 
     def _rows_are_chartable(self, rows: list[dict]) -> bool:
         if len(rows) < 2:
@@ -1862,15 +2087,15 @@ class ChatService:
 
     def _answer_prompt(self) -> str:
         return (
-            "You are a careful data analyst. Answer using only the provided query result. "
-            "Be concise, natural, and confident without overstating certainty. "
-            "Lead with the most important finding, mention concrete numbers, and use short bullets only when it helps clarity. "
-            "IMPORTANT: Always refer to data items by their human-readable name, title, or label. "
-            "Never show raw IDs, ObjectIds, UUIDs, or numeric foreign keys in your answer. "
-            "If the data contains both an ID and a name field, always use the name. "
-            "When the user asks to describe, explain, or summarize connected data, describe ALL tables/collections "
-            "and their relationships, field purposes, and key data patterns. "
-            "Do not mention JSON, internal prompts, or implementation details."
+            "You are a skilled data analyst assistant. Analyze the provided query result and answer the user's question clearly. "
+            "Lead with the most important finding. Use concrete numbers and percentages where available. "
+            "Use short bullet points only when listing 3+ distinct items — otherwise use natural prose. "
+            "Be confident but accurate — do not overstate what the data shows. "
+            "Always refer to items by their human-readable name or label, never by raw IDs, ObjectIds, UUIDs, or numeric keys. "
+            "If the data has both an ID field and a name field, always use the name in your answer. "
+            "If the result set is small (1-3 rows), give a direct factual answer. "
+            "If the result set is large (10+ rows), summarize the key patterns and top items. "
+            "Do not mention JSON, SQL, MongoDB, pipelines, prompts, or any technical implementation details."
         )
 
     def _answer_user_prompt(
@@ -2247,10 +2472,14 @@ class ChatService:
             if in_string(match.start()):
                 return match.group(0)
             token = match.group(0)
-            target = aliases.get(token.lower())
+            token_lower = token.lower()
+            # Never replace SQL keywords or function names
+            if token_lower in SQL_KEYWORDS:
+                return token
+            target = aliases.get(token_lower)
             if not target:
                 return token
-            if token.lower() in output_aliases:
+            if token_lower in output_aliases:
                 return token
 
             before = query[: match.start()]
@@ -2558,6 +2787,10 @@ class ChatService:
                         path = value.get("path") if isinstance(value, dict) else value
                         if isinstance(path, str) and path.startswith("$"):
                             available_fields.add(path.lstrip("$").split(".")[0].lower())
+                    elif operator in {"$replaceRoot", "$replaceWith"}:
+                        # After $replaceRoot the available fields change completely;
+                        # we cannot statically determine them, so stop checking.
+                        break
         else:
             query = query_plan.get("query", "")
             if query:
@@ -2646,36 +2879,24 @@ class ChatService:
     # ------------------------------------------------------------------ #
 
     def _sanity_check_results(self, question: str, query_plan: dict, rows: list[dict]) -> list[str]:
-        """Lightweight heuristic checks on query results. Returns warnings."""
+        """Lightweight heuristic checks on query results. Returns warnings (non-blocking by default)."""
         warnings: list[str] = []
         if not rows:
             return warnings
 
-        # Check: single-row result for a question that implies multiple
-        plural_signals = {"all", "each", "every", "list", "compare", "by", "per", "breakdown", "top", "distribution"}
+        # Check: single-row result for a question that clearly implies multiple distinct groups
+        hard_plural_signals = {"each", "every", "breakdown", "distribution", "compare", "comparison"}
         q_words = self._text_tokens(question)
-        if len(rows) == 1 and q_words.intersection(plural_signals):
+        if len(rows) == 1 and q_words.intersection(hard_plural_signals) and len(rows[0]) < 3:
             warnings.append("Query returned only 1 row but the question implies multiple results.")
 
-        # Check: result has only null/zero values in all numeric columns
-        numeric_values = [v for row in rows for v in row.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
-        if numeric_values and all(v == 0 for v in numeric_values):
-            warnings.append("All numeric values in the result are zero.")
-
-        # Check: returned columns don't overlap with anything in the question
-        if len(rows[0]) > 1:
-            result_keys = set()
-            for k in rows[0].keys():
-                result_keys.update(self._text_tokens(str(k)))
-            result_keys.update(self._query_plan_result_tokens(query_plan))
-            meaningful_q_words = {w for w in q_words if len(w) > 3}
-            has_match = any(
-                word in q_words or any(qw in word or word in qw for qw in meaningful_q_words)
-                for word in result_keys
-                if len(word) > 2
-            )
-            if not has_match and meaningful_q_words:
-                warnings.append("Result columns don't appear related to the question.")
+        # Check: result has only zero values in ALL numeric columns (likely wrong filter)
+        numeric_values = [
+            v for row in rows for v in row.values()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        if len(numeric_values) >= 3 and all(v == 0 for v in numeric_values):
+            warnings.append("All numeric values in the result are zero — the filter may be too restrictive.")
 
         return warnings[:3]
 
