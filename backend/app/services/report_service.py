@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import re
@@ -17,241 +18,395 @@ from app.db.mongo import get_database
 MIN_REPORT_USER_MESSAGES = 4
 logger = get_logger(__name__)
 
-# ── Colour palette ──────────────────────────────────────────────────
-PRIMARY     = "#1e40af"   # deep blue
-PRIMARY_MID = "#3b82f6"   # medium blue
-ACCENT      = "#0ea5e9"   # sky blue
-BG_DARK     = "#0f172a"   # header / footer
-BG_LIGHT    = "#f0f9ff"   # section tint
-BORDER      = "#bfdbfe"
-TEXT_DARK   = "#1e293b"
-TEXT_MID    = "#475569"
-TEXT_LIGHT  = "#f8fafc"
-BADGE_GREEN = "#dcfce7"
-BADGE_GREEN_TEXT = "#166534"
-BADGE_BLUE  = "#dbeafe"
-BADGE_BLUE_TEXT = "#1d4ed8"
+# ── Light colour palette ─────────────────────────────────────────────
+PRIMARY       = "#1a56db"
+CHART_COLORS  = ["#2563eb", "#f97316", "#06b6d4", "#8b5cf6", "#10b981",
+                 "#f59e0b", "#ef4444", "#14b8a6"]
 
 REPORT_CSS = """
-@page {
-  size: A4;
-  margin: 0;
-}
-
+@page { size: A4; margin: 0; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-
 body {
   font-family: Helvetica, Arial, sans-serif;
   font-size: 10pt;
-  color: #1e293b;
+  color: #111827;
   background: #ffffff;
 }
 
-/* ── Cover / header band ── */
-.cover {
-  background: #0f172a;
-  color: #f8fafc;
-  padding: 40pt 48pt 32pt;
-  border-bottom: 4pt solid #3b82f6;
+/* ── Top brand bar ── */
+.top-bar {
+  background: #ffffff;
+  border-top: 4pt solid #2563eb;
+  padding: 16pt 44pt 12pt;
 }
-.cover-brand {
-  font-size: 10pt;
-  color: #93c5fd;
-  letter-spacing: 2pt;
-  text-transform: uppercase;
-  margin-bottom: 20pt;
+.brand-row {
+  display: table; width: 100%;
 }
-.cover-title {
-  font-size: 22pt;
-  font-weight: bold;
-  color: #f0f9ff;
-  margin-bottom: 8pt;
-  line-height: 1.25;
+.brand-left { display: table-cell; vertical-align: top; }
+.brand-right { display: table-cell; vertical-align: top; text-align: right; }
+.brand-name {
+  font-size: 11pt; font-weight: bold; color: #2563eb; letter-spacing: 0.5pt;
 }
-.cover-subtitle {
-  font-size: 10pt;
-  color: #93c5fd;
-  margin-bottom: 20pt;
+.brand-sub { font-size: 8pt; color: #6b7280; margin-top: 1pt; }
+.top-right-meta { font-size: 8pt; color: #6b7280; }
+.confidential-badge {
+  background: #fef3c7; color: #92400e;
+  font-size: 7pt; font-weight: bold;
+  padding: 2pt 8pt; border-radius: 10pt;
+  display: inline-block; margin-top: 3pt;
 }
-.cover-meta {
-  font-size: 8pt;
-  color: #64748b;
-  border-top: 0.5pt solid #1e3a5f;
-  padding-top: 12pt;
-  margin-top: 20pt;
+
+/* ── Title block ── */
+.title-block {
+  padding: 14pt 44pt 14pt;
+  border-bottom: 1pt solid #e5e7eb;
+}
+.report-title {
+  font-size: 22pt; font-weight: bold; color: #111827;
+  line-height: 1.2; margin-bottom: 5pt;
+}
+.report-meta { font-size: 8.5pt; color: #6b7280; margin-bottom: 10pt; }
+
+/* ── KPI cards ── */
+.kpi-row {
+  display: table; width: 100%; border-collapse: collapse;
+  border: 1pt solid #e5e7eb; border-radius: 4pt;
+  margin-top: 8pt;
+}
+.kpi-cell {
+  display: table-cell;
+  padding: 10pt 14pt;
+  border-right: 1pt solid #e5e7eb;
+  vertical-align: top;
+  width: 20%;
+}
+.kpi-cell:last-child { border-right: none; }
+.kpi-value {
+  font-size: 15pt; font-weight: bold; color: #111827; line-height: 1.2;
+}
+.kpi-label { font-size: 7.5pt; color: #6b7280; margin-top: 2pt; }
+
+/* ── Stat badges ── */
+.stat-row { margin-top: 8pt; }
+.stat-badge {
+  display: inline-block;
+  background: #dbeafe; color: #1d4ed8;
+  font-size: 7.5pt; font-weight: bold;
+  padding: 2pt 9pt; border-radius: 10pt;
+  margin-right: 5pt;
 }
 
 /* ── Body wrapper ── */
-.body-wrap {
-  padding: 28pt 48pt 32pt;
-}
+.body-wrap { padding: 20pt 44pt 30pt; }
 
 /* ── Section headings ── */
 .section-header {
-  background: #1e40af;
+  background: #1a56db;
   color: #f0f9ff;
-  font-size: 11pt;
-  font-weight: bold;
-  padding: 7pt 14pt;
-  border-radius: 4pt;
-  margin-top: 22pt;
-  margin-bottom: 10pt;
+  font-size: 10.5pt; font-weight: bold;
+  padding: 6pt 12pt;
+  border-radius: 3pt;
+  margin-top: 20pt; margin-bottom: 10pt;
 }
 
-/* ── Executive summary box ── */
+/* ── Summary box ── */
 .summary-box {
   background: #f0f9ff;
-  border-left: 4pt solid #3b82f6;
-  border-radius: 4pt;
-  padding: 14pt 16pt;
-  margin-bottom: 18pt;
-  font-size: 10pt;
-  color: #1e293b;
-  line-height: 1.6;
+  border-left: 3.5pt solid #2563eb;
+  border-radius: 3pt;
+  padding: 11pt 14pt;
+  margin-bottom: 14pt;
+  font-size: 9.5pt; color: #374151; line-height: 1.65;
 }
 
 /* ── Bullet lists ── */
-.bullet-list { margin: 0 0 8pt 0; padding: 0; }
+.bullet-list { margin: 0 0 6pt 0; padding: 0; }
 .bullet-item {
-  font-size: 9.5pt;
-  color: #334155;
-  padding: 4pt 0 4pt 18pt;
-  line-height: 1.55;
-  border-bottom: 0.5pt solid #e2e8f0;
+  font-size: 9.5pt; color: #374151;
+  padding: 4pt 0 4pt 14pt; line-height: 1.55;
+  border-bottom: 0.5pt solid #f3f4f6;
 }
 .bullet-item:last-child { border-bottom: none; }
 
-/* ── Stat badges ── */
-.stat-row {
-  margin-bottom: 14pt;
-}
-.stat-badge {
-  display: inline-block;
-  background: #dbeafe;
-  color: #1d4ed8;
-  font-size: 8pt;
-  font-weight: bold;
-  padding: 3pt 10pt;
-  border-radius: 10pt;
-  margin-right: 6pt;
-  margin-bottom: 4pt;
-}
-
 /* ── Data tables ── */
 .data-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 6pt;
-  margin-bottom: 14pt;
-  font-size: 8.5pt;
+  width: 100%; border-collapse: collapse;
+  margin-top: 6pt; margin-bottom: 4pt; font-size: 8.5pt;
 }
 .data-table th {
-  background: #1e40af;
-  color: #f0f9ff;
-  padding: 6pt 8pt;
-  text-align: left;
-  font-weight: bold;
+  background: #1a56db; color: #ffffff;
+  padding: 5pt 9pt; text-align: left; font-weight: bold;
 }
 .data-table td {
-  padding: 5pt 8pt;
-  color: #334155;
-  border-bottom: 0.5pt solid #e2e8f0;
+  padding: 4pt 9pt; color: #374151;
+  border-bottom: 0.5pt solid #f3f4f6;
 }
-.data-table tr:nth-child(even) td {
-  background: #f8fafc;
-}
+.data-table tr:nth-child(even) td { background: #f9fafb; }
 
-/* ── Chart placeholder ── */
-.chart-placeholder {
-  background: #f8fafc;
-  border: 1pt solid #bfdbfe;
+/* ── Viz block ── */
+.viz-block {
+  background: #ffffff;
+  border: 1pt solid #e5e7eb;
   border-radius: 4pt;
-  padding: 10pt 14pt;
-  margin: 8pt 0 12pt;
-  font-size: 8.5pt;
-  color: #475569;
+  padding: 12pt 14pt 8pt;
+  margin: 0 0 14pt 0;
+  page-break-inside: avoid;
 }
-.chart-title {
-  font-size: 9.5pt;
-  font-weight: bold;
-  color: #1e40af;
-  margin-bottom: 6pt;
+.viz-title {
+  font-size: 10pt; font-weight: bold; color: #111827;
+  margin-bottom: 8pt; text-align: center;
 }
+.viz-caption {
+  font-size: 7.5pt; color: #9ca3af;
+  margin-top: 6pt; text-align: center;
+}
+.viz-chart { text-align: center; margin: 4pt 0; }
 
-/* ── Conversation excerpts ── */
+/* ── Conversation ── */
 .message-block {
-  margin-bottom: 10pt;
-  padding: 8pt 12pt;
-  border-radius: 4pt;
-  font-size: 9pt;
-  line-height: 1.55;
+  margin-bottom: 8pt; padding: 7pt 11pt;
+  border-radius: 3pt; font-size: 9pt; line-height: 1.55;
 }
 .message-user {
-  background: #f0f9ff;
-  border-left: 3pt solid #3b82f6;
-  color: #1e293b;
+  background: #eff6ff; border-left: 3pt solid #2563eb; color: #1e40af;
 }
 .message-assistant {
-  background: #f8fafc;
-  border-left: 3pt solid #0ea5e9;
-  color: #334155;
+  background: #f9fafb; border-left: 3pt solid #d1d5db; color: #374151;
 }
 .message-role {
-  font-size: 7.5pt;
-  font-weight: bold;
-  text-transform: uppercase;
-  letter-spacing: 0.5pt;
-  color: #64748b;
-  margin-bottom: 3pt;
+  font-size: 7pt; font-weight: bold; text-transform: uppercase;
+  letter-spacing: 0.5pt; color: #6b7280; margin-bottom: 3pt;
 }
 
-/* ── Page divider ── */
-.divider {
-  border: none;
-  border-top: 0.5pt solid #bfdbfe;
-  margin: 16pt 0;
-}
-
-/* ── Footer ── */
+/* ── Divider / footer ── */
+.divider { border: none; border-top: 0.5pt solid #e5e7eb; margin: 12pt 0; }
 .footer {
-  background: #0f172a;
-  color: #64748b;
-  font-size: 7pt;
-  padding: 8pt 48pt;
-  border-top: 2pt solid #1e40af;
+  background: #f9fafb; color: #9ca3af;
+  font-size: 7pt; padding: 7pt 44pt;
+  border-top: 1pt solid #e5e7eb;
+  display: table; width: 100%;
 }
+.footer-left  { display: table-cell; }
+.footer-right { display: table-cell; text-align: right; }
 """
 
 
+# ── Matplotlib chart helpers ─────────────────────────────────────────
+
+def _chart_to_b64(fig) -> str:
+    """Render a matplotlib figure to base64 PNG."""
+    import matplotlib.pyplot as plt
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                facecolor="#ffffff", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("ascii")
+
+
+def _bar_chart_b64(rows: list[dict]) -> str:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+    except ImportError:
+        return ""
+
+    if not rows:
+        return ""
+    keys = list(rows[0].keys())
+    label_key, value_key = keys[0], (keys[1] if len(keys) > 1 else keys[0])
+    labels = [str(r.get(label_key, ""))[:18] for r in rows[:10]]
+    try:
+        values = [float(r.get(value_key, 0) or 0) for r in rows[:10]]
+    except (TypeError, ValueError):
+        return ""
+
+    n = len(labels)
+    fig_h = max(2.6, 0.45 * n + 0.8)
+    fig, ax = plt.subplots(figsize=(6.5, fig_h))
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#ffffff")
+
+    colors = [CHART_COLORS[i % len(CHART_COLORS)] for i in range(n)]
+
+    if n <= 6:
+        # vertical
+        bars = ax.bar(labels, values, color=colors, width=0.55, zorder=3)
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(labels, fontsize=8, rotation=20 if n > 4 else 0, ha="right")
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
+                    _fmt_value(val), ha="center", va="bottom", fontsize=7.5, fontweight="bold", color="#111827")
+    else:
+        # horizontal
+        bars = ax.barh(labels[::-1], values[::-1], color=colors[::-1], height=0.55, zorder=3)
+        for bar, val in zip(bars, values[::-1]):
+            ax.text(bar.get_width() + max(values) * 0.01, bar.get_y() + bar.get_height() / 2,
+                    _fmt_value(val), ha="left", va="center", fontsize=7.5, fontweight="bold", color="#111827")
+        ax.set_xlabel("")
+
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: _fmt_value(x)))
+    ax.tick_params(axis="y", labelsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#e5e7eb")
+    ax.spines["bottom"].set_color("#e5e7eb")
+    ax.yaxis.grid(True, color="#f3f4f6", zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout(pad=0.4)
+    return _chart_to_b64(fig)
+
+
+def _line_chart_b64(rows: list[dict]) -> str:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+    except ImportError:
+        return ""
+
+    if not rows:
+        return ""
+    keys = list(rows[0].keys())
+    label_key, value_key = keys[0], (keys[1] if len(keys) > 1 else keys[0])
+    labels = [str(r.get(label_key, "")) for r in rows[:12]]
+    try:
+        values = [float(r.get(value_key, 0) or 0) for r in rows[:12]]
+    except (TypeError, ValueError):
+        return ""
+
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#ffffff")
+
+    xs = range(len(labels))
+    ax.fill_between(xs, values, alpha=0.08, color="#2563eb")
+    ax.plot(xs, values, color="#2563eb", linewidth=2.2, marker="o",
+            markersize=5, markerfacecolor="#2563eb", markeredgecolor="#ffffff",
+            markeredgewidth=1.5, zorder=3)
+
+    # value labels
+    for i, v in enumerate(values):
+        ax.text(i, v + max(values) * 0.02, _fmt_value(v),
+                ha="center", va="bottom", fontsize=7, fontweight="bold", color="#111827")
+
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels(labels, fontsize=8, rotation=30 if len(labels) > 6 else 0, ha="right")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: _fmt_value(x)))
+    ax.tick_params(axis="y", labelsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#e5e7eb")
+    ax.spines["bottom"].set_color("#e5e7eb")
+    ax.yaxis.grid(True, color="#f3f4f6", zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout(pad=0.4)
+    return _chart_to_b64(fig)
+
+
+def _pie_chart_b64(rows: list[dict]) -> str:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return ""
+
+    if not rows:
+        return ""
+    keys = list(rows[0].keys())
+    label_key, value_key = keys[0], (keys[1] if len(keys) > 1 else keys[0])
+    labels = [str(r.get(label_key, ""))[:20] for r in rows[:6]]
+    try:
+        values = [float(r.get(value_key, 0) or 0) for r in rows[:6]]
+    except (TypeError, ValueError):
+        return ""
+
+    colors = [CHART_COLORS[i % len(CHART_COLORS)] for i in range(len(labels))]
+    fig, ax = plt.subplots(figsize=(5.5, 2.8))
+    fig.patch.set_facecolor("#ffffff")
+    wedges, texts, autotexts = ax.pie(
+        values, labels=None, colors=colors,
+        autopct="%1.1f%%", startangle=90,
+        wedgeprops={"linewidth": 1.5, "edgecolor": "#ffffff"},
+        pctdistance=0.75,
+    )
+    for at in autotexts:
+        at.set_fontsize(7.5)
+        at.set_color("#ffffff")
+        at.set_fontweight("bold")
+    # Donut hole
+    centre = plt.Circle((0, 0), 0.5, fc="#ffffff")
+    ax.add_patch(centre)
+    # Legend
+    ax.legend(wedges, [f"{l}  {_fmt_value(v)}" for l, v in zip(labels, values)],
+              loc="center left", bbox_to_anchor=(1, 0.5),
+              fontsize=8, frameon=False)
+    ax.set_aspect("equal")
+    plt.tight_layout(pad=0.4)
+    return _chart_to_b64(fig)
+
+
+def _render_chart_b64(payload: dict) -> str:
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    if not rows:
+        return ""
+    chart_type = str(payload.get("chart_type") or "BAR").upper()
+    if chart_type == "LINE":
+        return _line_chart_b64(rows)
+    if chart_type in ("PIE", "DONUT"):
+        return _pie_chart_b64(rows)
+    return _bar_chart_b64(rows)
+
+
+def _fmt_value(v: float) -> str:
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        s = f"{v / 1_000_000:.1f}M"
+        return f"${s}" if v >= 0 else f"-${s[1:]}"
+    if abs_v >= 1_000:
+        s = f"{v / 1_000:.1f}K"
+        return f"${s}" if v >= 0 else f"-${s[1:]}"
+    if abs_v == int(abs_v):
+        return str(int(v))
+    return f"{v:.2f}"
+
+
+# ── HTML builder ─────────────────────────────────────────────────────
+
 def _build_html_report(*, session: dict, narrative: dict[str, Any]) -> str:
     messages = session.get("messages", [])
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    asst_msgs = [m for m in messages if m.get("role") == "assistant"]
+    user_msgs  = [m for m in messages if m.get("role") == "user"]
+    asst_msgs  = [m for m in messages if m.get("role") == "assistant"]
     visual_payloads = _visual_payloads(messages)
-    generated_at = datetime.now().strftime("%B %d, %Y  %H:%M")
+    generated_at = datetime.now().strftime("%d %b %Y")
     title = _esc(str(narrative.get("title") or session.get("title") or "DataSage Analytics Report"))
+    first_user_q = _esc(_trunc(str(user_msgs[0].get("content") or ""), 80)) if user_msgs else ""
 
     def bullet_section(heading: str, items: Any) -> str:
         if isinstance(items, str):
             items = [items]
-        rows = "".join(
-            f'<div class="bullet-item">&#8226;&nbsp; {_esc(str(item))}</div>'
+        rows_html = "".join(
+            f'<div class="bullet-item">&#8226;&ensp;{_esc(str(item))}</div>'
             for item in (items or ["No additional notes."])
         )
-        return f'<div class="section-header">{heading}</div><div class="bullet-list">{rows}</div>'
+        return f'<div class="section-header">{heading}</div><div class="bullet-list">{rows_html}</div>'
 
     def data_table_html(rows: list[dict]) -> str:
         if not rows:
             return ""
         headers = list(rows[0].keys())[:6]
-        ths = "".join(f"<th>{_esc(h)}</th>" for h in headers)
+        ths = "".join(f"<th>{_esc(str(h).replace('_', ' ').title())}</th>" for h in headers)
         trs = ""
-        for row in rows[:8]:
+        for row in rows[:10]:
             tds = "".join(f"<td>{_esc(_trunc(str(row.get(h, '')), 40))}</td>" for h in headers)
             trs += f"<tr>{tds}</tr>"
         return f'<table class="data-table"><tr>{ths}</tr>{trs}</table>'
 
-    # Stats badges
+    # ── Stat badges ──
     stats_html = (
         f'<div class="stat-row">'
         f'<span class="stat-badge">&#128172; {len(user_msgs)} user messages</span>'
@@ -260,29 +415,39 @@ def _build_html_report(*, session: dict, narrative: dict[str, Any]) -> str:
         f'</div>'
     )
 
-    # Visualizations
+    # ── Visualizations ──
     viz_html = ""
     if visual_payloads:
         viz_html += '<div class="section-header">Visualizations &amp; Data</div>'
-        for idx, payload in enumerate(visual_payloads[:5], 1):
+        for idx, payload in enumerate(visual_payloads[:6], 1):
             rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
-            vtitle = _esc(_trunc(str(payload.get("summary") or payload.get("explanation") or f"Visualization {idx}"), 120))
-            chart_type = str(payload.get("chart_type") or "table").upper()
+            vtitle_raw = str(payload.get("explanation") or payload.get("summary") or f"Visualization {idx}")
+            vtitle = _esc(_trunc(vtitle_raw, 120))
+            chart_type = str(payload.get("chart_type") or "BAR").upper()
+            b64 = _render_chart_b64(payload)
+            chart_img = (
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="width:100%;max-width:480pt;" />'
+                if b64 else ""
+            )
             viz_html += f"""
-<div class="chart-placeholder">
-  <div class="chart-title">&#128202; {vtitle} <span style="font-size:7.5pt;color:#94a3b8;">[{chart_type}]</span></div>
+<div class="viz-block">
+  <div class="viz-title">{vtitle}</div>
+  <div class="viz-chart">{chart_img}</div>
+  <div class="viz-caption">&#9632; {chart_type} chart &bull; {len(rows)} data rows</div>
   {data_table_html(rows)}
 </div>"""
 
-    # Conversation excerpts (last 14 messages)
-    convo_html = '<div class="section-header">Conversation Excerpts</div>'
-    for msg in messages[-14:]:
+    # ── Conversation transcript ──
+    convo_html = '<div class="section-header">Session Transcript</div>'
+    convo_html += '<p style="font-size:8pt;color:#9ca3af;margin-bottom:10pt;">Full record of the analyst\'s queries and DataSage AI responses during this session.</p>'
+    for msg in messages:
         role = str(msg.get("role") or "")
         content = _esc(_trunc(str(msg.get("content") or ""), 800))
         if role == "user":
-            convo_html += f'<div class="message-block message-user"><div class="message-role">&#128100; You</div>{content}</div>'
+            convo_html += f'<div class="message-block message-user"><div class="message-role">&#9632; You</div>{content}</div>'
         elif role == "assistant":
-            convo_html += f'<div class="message-block message-assistant"><div class="message-role">&#129302; DataSage AI</div>{content}</div>'
+            convo_html += f'<div class="message-block message-assistant"><div class="message-role">&#9632; DataSage AI</div>{content}</div>'
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -292,13 +457,27 @@ def _build_html_report(*, session: dict, narrative: dict[str, Any]) -> str:
 </head>
 <body>
 
-<!-- COVER -->
-<div class="cover">
-  <div class="cover-brand">DataSage AI &bull; Analytics Report</div>
-  <div class="cover-title">{title}</div>
-  <div class="cover-subtitle">AI-Powered Data Analysis Summary</div>
+<!-- TOP BRAND BAR -->
+<div class="top-bar">
+  <div class="brand-row">
+    <div class="brand-left">
+      <div class="brand-name">DATASAGE AI</div>
+      <div class="brand-sub">AI-Powered Analytics Platform</div>
+    </div>
+    <div class="brand-right">
+      <div class="top-right-meta">Generated: {generated_at}</div>
+      <div><span class="confidential-badge">CONFIDENTIAL</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- TITLE BLOCK -->
+<div class="title-block">
+  <div class="report-title">{title}</div>
+  <div class="report-meta">
+    {first_user_q} &middot; Session Report &middot; {len(user_msgs)} queries &middot; {len(visual_payloads)} visualisations
+  </div>
   {stats_html}
-  <div class="cover-meta">Generated on {generated_at} &bull; Confidential &bull; DataSage</div>
 </div>
 
 <div class="body-wrap">
@@ -322,7 +501,8 @@ def _build_html_report(*, session: dict, narrative: dict[str, Any]) -> str:
 
 <!-- FOOTER -->
 <div class="footer">
-  DataSage AI &bull; Confidential Analytics Report &bull; {generated_at}
+  <span class="footer-left">DataSage AI &bull; Confidential Analytics Report</span>
+  <span class="footer-right">Page 1</span>
 </div>
 
 </body>
@@ -450,7 +630,7 @@ class ReportService:
 
     def _fallback_narrative(self, session: dict) -> dict[str, Any]:
         messages = session.get("messages", [])
-        user_messages = [str(m.get("content") or "").strip() for m in messages if m.get("role") == "user"]
+        user_messages     = [str(m.get("content") or "").strip() for m in messages if m.get("role") == "user"]
         assistant_messages = [str(m.get("content") or "").strip() for m in messages if m.get("role") == "assistant"]
         visuals = _visual_summaries(messages)
         title = str(session.get("title") or "DataSage Analytics Report")
@@ -524,9 +704,7 @@ class ReportService:
         try:
             from xhtml2pdf import pisa  # type: ignore
         except ImportError as exc:
-            raise RuntimeError(
-                "xhtml2pdf is not installed. Run: pip install xhtml2pdf"
-            ) from exc
+            raise RuntimeError("xhtml2pdf is not installed. Run: pip install xhtml2pdf") from exc
 
         html = _build_html_report(session=session, narrative=narrative)
         buffer = io.BytesIO()
