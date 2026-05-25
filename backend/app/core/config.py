@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = Field(default=7, alias="REFRESH_TOKEN_EXPIRE_DAYS")
 
     cors_origins: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["http://127.0.0.1:3000"],
+        default_factory=lambda: ["http://127.0.0.1:3000", "http://localhost:3000"],
         alias="CORS_ORIGINS",
     )
     encryption_key: str = Field(default="change-me-encryption", alias="ENCRYPTION_KEY")

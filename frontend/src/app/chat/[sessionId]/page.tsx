@@ -129,12 +129,19 @@ export default function ChatSessionPage() {
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const messageBudget = getMessageBudgetState(input);
   const userMessageCount = messages.filter((message) => message.role === "user").length;
-  const canGenerateReport = userMessageCount >= MIN_REPORT_USER_MESSAGES;
+  // serverMessageCount = null means session hasn't loaded yet.
+  // serverMessageCount = 0 means it's a brand-new session → enforce 4-message minimum.
+  // serverMessageCount > 0 means existing session → always allow report if ≥4 total messages.
+  const [serverMessageCount, setServerMessageCount] = useState<number | null>(null);
+  const effectiveCount = serverMessageCount !== null && serverMessageCount > 0
+    ? Math.max(serverMessageCount, userMessageCount)   // old session: credit existing messages
+    : userMessageCount;                                 // new session: count only current messages
+  const canGenerateReport = effectiveCount >= MIN_REPORT_USER_MESSAGES;
   const reportDisabled = reportLoading || loading || !canGenerateReport;
   const reportTitle = canGenerateReport
     ? "Generate report PDF"
-    : `Send ${MIN_REPORT_USER_MESSAGES - userMessageCount} more message${
-        MIN_REPORT_USER_MESSAGES - userMessageCount === 1 ? "" : "s"
+    : `Send ${MIN_REPORT_USER_MESSAGES - effectiveCount} more message${
+        MIN_REPORT_USER_MESSAGES - effectiveCount === 1 ? "" : "s"
       } to generate a report`;
 
   const markConnectionInactive = () => {
@@ -171,7 +178,9 @@ export default function ChatSessionPage() {
       try {
         const response = await api.get(`/sessions/${sessionId}`);
         const session: SessionResponse = response.data.data;
-        setMessages((session.messages || []).map((message) => ({ ...message, status: "complete", stage_label: undefined })));
+        const loadedMessages: Message[] = (session.messages || []).map((message) => ({ ...message, status: "complete" as const, stage_label: undefined }));
+        setMessages(loadedMessages);
+        setServerMessageCount(loadedMessages.filter((m) => m.role === "user").length);
         const nextSource = session.data_source || null;
         setSourceConfig(nextSource);
         setIsConnected(false);
@@ -572,47 +581,52 @@ export default function ChatSessionPage() {
   };
 
   const handleDownloadReport = async () => {
-    if (!sessionId || reportDisabled) {
-      return;
-    }
+    if (!sessionId) return;
+
+    // Bypass Next.js rewrite proxy — it times out on long-running requests (report takes 20-45s).
+    const BACKEND = (process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000").replace(/\/+$/, "");
 
     try {
       setReportLoading(true);
+
       let token = localStorage.getItem("access_token");
-      const requestReport = (accessToken: string | null) =>
-        fetch(`${API}/chat/${sessionId}/report`, {
-          headers: {
-            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-          },
+
+      const doFetch = (t: string | null) =>
+        fetch(`${BACKEND}/chat/${sessionId}/report`, {
+          headers: t ? { Authorization: `Bearer ${t}` } : {},
         });
 
-      let response = await requestReport(token);
+      let response = await doFetch(token);
+
       if (response.status === 401) {
         token = await refreshAccessToken();
-        response = await requestReport(token);
+        response = await doFetch(token);
       }
 
       if (!response.ok) {
-        throw new Error((await response.text()) || "Report generation failed.");
+        let errText = "Report generation failed.";
+        try { errText = (await response.text()) || errText; } catch { /* ignore */ }
+        throw new Error(errText);
       }
 
       const blob = await response.blob();
-      const contentDisposition = response.headers.get("content-disposition") || "";
-      const filenameMatch = contentDisposition.match(/filename="([^"]+)"/);
-      const filename = filenameMatch?.[1] || "datasage-report.pdf";
+      const cd = response.headers.get("content-disposition") ?? "";
+      const filename = cd.match(/filename="([^"]+)"/)?.[1] ?? "datasage-report.pdf";
+
       const href = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = href;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(href);
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Delay revoke so browser has time to read the blob before it's freed
+      setTimeout(() => window.URL.revokeObjectURL(href), 3000);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Report generation failed.";
-      setMessages((current) => [
-        ...current,
-        { role: "assistant", content: message, status: "complete", stage_label: undefined },
+      const msg = error instanceof Error ? error.message : "Report generation failed.";
+      setMessages((cur) => [
+        ...cur,
+        { role: "assistant", content: `⚠️ ${msg}`, status: "complete" as const, stage_label: undefined },
       ]);
     } finally {
       setReportLoading(false);
@@ -672,14 +686,12 @@ export default function ChatSessionPage() {
                     <FileText size={16} />
                     {reportLoading ? "Creating PDF" : "Generate report"}
                   </button>
-                  {sourceConfigured ? (
-null
-                  ) : (
+                  {!sourceConfigured ? (
                     <button type="button" className="status-pill warning" onClick={() => { setConnectorModalMode("all"); setIsModalOpen(true); }}>
                       <AlertCircle size={16} />
                       Connect data first
                     </button>
-                  )}
+                  ) : null}
                 </div>
               </header>
 

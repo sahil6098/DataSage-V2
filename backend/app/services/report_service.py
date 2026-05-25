@@ -3,16 +3,11 @@ from __future__ import annotations
 import io
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 import httpx
 from bson import ObjectId
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.pdfgen.canvas import Canvas
-from reportlab.platypus import Flowable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -22,110 +17,362 @@ from app.db.mongo import get_database
 MIN_REPORT_USER_MESSAGES = 4
 logger = get_logger(__name__)
 
+# ── Colour palette ──────────────────────────────────────────────────
+PRIMARY     = "#1e40af"   # deep blue
+PRIMARY_MID = "#3b82f6"   # medium blue
+ACCENT      = "#0ea5e9"   # sky blue
+BG_DARK     = "#0f172a"   # header / footer
+BG_LIGHT    = "#f0f9ff"   # section tint
+BORDER      = "#bfdbfe"
+TEXT_DARK   = "#1e293b"
+TEXT_MID    = "#475569"
+TEXT_LIGHT  = "#f8fafc"
+BADGE_GREEN = "#dcfce7"
+BADGE_GREEN_TEXT = "#166534"
+BADGE_BLUE  = "#dbeafe"
+BADGE_BLUE_TEXT = "#1d4ed8"
 
-class ReportChart(Flowable):
-    def __init__(self, title: str, rows: list[dict[str, Any]], chart_type: str | None) -> None:
-        super().__init__()
-        self.title = title
-        self.rows = rows[:8]
-        self.chart_type = chart_type or "bar"
-        self.width = 6.7 * inch
-        self.height = 2.6 * inch
+REPORT_CSS = """
+@page {
+  size: A4;
+  margin: 0;
+}
 
-    def draw(self) -> None:
-        canvas: Canvas = self.canv
-        canvas.setFont("Helvetica-Bold", 10)
-        canvas.setFillColor(colors.HexColor("#1f2937"))
-        canvas.drawString(0, self.height - 12, self.title[:90])
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
-        labels, values = self._labels_and_values()
-        if not labels or not values:
-            self._draw_table_preview(canvas)
-            return
+body {
+  font-family: Helvetica, Arial, sans-serif;
+  font-size: 10pt;
+  color: #1e293b;
+  background: #ffffff;
+}
 
-        if self.chart_type in {"line", "radar"}:
-            self._draw_line(canvas, labels, values)
-        else:
-            self._draw_bars(canvas, labels, values)
+/* ── Cover / header band ── */
+.cover {
+  background: #0f172a;
+  color: #f8fafc;
+  padding: 40pt 48pt 32pt;
+  border-bottom: 4pt solid #3b82f6;
+}
+.cover-brand {
+  font-size: 10pt;
+  color: #93c5fd;
+  letter-spacing: 2pt;
+  text-transform: uppercase;
+  margin-bottom: 20pt;
+}
+.cover-title {
+  font-size: 22pt;
+  font-weight: bold;
+  color: #f0f9ff;
+  margin-bottom: 8pt;
+  line-height: 1.25;
+}
+.cover-subtitle {
+  font-size: 10pt;
+  color: #93c5fd;
+  margin-bottom: 20pt;
+}
+.cover-meta {
+  font-size: 8pt;
+  color: #64748b;
+  border-top: 0.5pt solid #1e3a5f;
+  padding-top: 12pt;
+  margin-top: 20pt;
+}
 
-    def _labels_and_values(self) -> tuple[list[str], list[float]]:
-        if not self.rows:
-            return [], []
-        first = self.rows[0]
-        numeric_key = next((key for key, value in first.items() if isinstance(value, (int, float))), None)
-        label_key = next((key for key, value in first.items() if key != numeric_key and not isinstance(value, (int, float))), None)
-        if not numeric_key:
-            return [], []
-        labels = [str(row.get(label_key) if label_key else index + 1) for index, row in enumerate(self.rows)]
-        values = [float(row.get(numeric_key) or 0) for row in self.rows]
-        return labels, values
+/* ── Body wrapper ── */
+.body-wrap {
+  padding: 28pt 48pt 32pt;
+}
 
-    def _draw_bars(self, canvas: Canvas, labels: list[str], values: list[float]) -> None:
-        left = 28
-        bottom = 34
-        chart_width = self.width - 56
-        chart_height = self.height - 72
-        max_value = max(max(values), 1)
-        bar_gap = 8
-        bar_width = max(12, (chart_width - bar_gap * (len(values) - 1)) / max(len(values), 1))
+/* ── Section headings ── */
+.section-header {
+  background: #1e40af;
+  color: #f0f9ff;
+  font-size: 11pt;
+  font-weight: bold;
+  padding: 7pt 14pt;
+  border-radius: 4pt;
+  margin-top: 22pt;
+  margin-bottom: 10pt;
+}
 
-        canvas.setStrokeColor(colors.HexColor("#d1d5db"))
-        canvas.line(left, bottom, left + chart_width, bottom)
-        canvas.setFillColor(colors.HexColor("#2563eb"))
-        for index, value in enumerate(values):
-            bar_height = (value / max_value) * chart_height
-            x = left + index * (bar_width + bar_gap)
-            canvas.rect(x, bottom, bar_width, bar_height, fill=1, stroke=0)
-            canvas.setFillColor(colors.HexColor("#374151"))
-            canvas.setFont("Helvetica", 7)
-            canvas.drawCentredString(x + bar_width / 2, bottom - 12, labels[index][:12])
-            canvas.drawCentredString(x + bar_width / 2, bottom + bar_height + 4, self._format_number(value))
-            canvas.setFillColor(colors.HexColor("#2563eb"))
+/* ── Executive summary box ── */
+.summary-box {
+  background: #f0f9ff;
+  border-left: 4pt solid #3b82f6;
+  border-radius: 4pt;
+  padding: 14pt 16pt;
+  margin-bottom: 18pt;
+  font-size: 10pt;
+  color: #1e293b;
+  line-height: 1.6;
+}
 
-    def _draw_line(self, canvas: Canvas, labels: list[str], values: list[float]) -> None:
-        left = 28
-        bottom = 34
-        chart_width = self.width - 56
-        chart_height = self.height - 72
-        max_value = max(max(values), 1)
-        step = chart_width / max(len(values) - 1, 1)
-        points = []
-        for index, value in enumerate(values):
-            x = left + index * step
-            y = bottom + (value / max_value) * chart_height
-            points.append((x, y))
+/* ── Bullet lists ── */
+.bullet-list { margin: 0 0 8pt 0; padding: 0; }
+.bullet-item {
+  font-size: 9.5pt;
+  color: #334155;
+  padding: 4pt 0 4pt 18pt;
+  line-height: 1.55;
+  border-bottom: 0.5pt solid #e2e8f0;
+}
+.bullet-item:last-child { border-bottom: none; }
 
-        canvas.setStrokeColor(colors.HexColor("#d1d5db"))
-        canvas.line(left, bottom, left + chart_width, bottom)
-        canvas.setStrokeColor(colors.HexColor("#0f766e"))
-        canvas.setLineWidth(1.8)
-        for start, end in zip(points, points[1:]):
-            canvas.line(start[0], start[1], end[0], end[1])
-        canvas.setFillColor(colors.HexColor("#0f766e"))
-        for index, (x, y) in enumerate(points):
-            canvas.circle(x, y, 2.5, fill=1, stroke=0)
-            canvas.setFillColor(colors.HexColor("#374151"))
-            canvas.setFont("Helvetica", 7)
-            canvas.drawCentredString(x, bottom - 12, labels[index][:12])
-            canvas.setFillColor(colors.HexColor("#0f766e"))
+/* ── Stat badges ── */
+.stat-row {
+  margin-bottom: 14pt;
+}
+.stat-badge {
+  display: inline-block;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 8pt;
+  font-weight: bold;
+  padding: 3pt 10pt;
+  border-radius: 10pt;
+  margin-right: 6pt;
+  margin-bottom: 4pt;
+}
 
-    def _draw_table_preview(self, canvas: Canvas) -> None:
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillColor(colors.HexColor("#4b5563"))
-        y = self.height - 34
-        for row in self.rows[:5]:
-            text = ", ".join(f"{key}: {value}" for key, value in list(row.items())[:3])
-            canvas.drawString(24, y, text[:110])
-            y -= 14
+/* ── Data tables ── */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 6pt;
+  margin-bottom: 14pt;
+  font-size: 8.5pt;
+}
+.data-table th {
+  background: #1e40af;
+  color: #f0f9ff;
+  padding: 6pt 8pt;
+  text-align: left;
+  font-weight: bold;
+}
+.data-table td {
+  padding: 5pt 8pt;
+  color: #334155;
+  border-bottom: 0.5pt solid #e2e8f0;
+}
+.data-table tr:nth-child(even) td {
+  background: #f8fafc;
+}
 
-    def _format_number(self, value: float) -> str:
-        if abs(value) >= 1_000_000:
-            return f"{value / 1_000_000:.1f}M"
-        if abs(value) >= 1_000:
-            return f"{value / 1_000:.1f}K"
-        if value.is_integer():
-            return str(int(value))
-        return f"{value:.2f}"
+/* ── Chart placeholder ── */
+.chart-placeholder {
+  background: #f8fafc;
+  border: 1pt solid #bfdbfe;
+  border-radius: 4pt;
+  padding: 10pt 14pt;
+  margin: 8pt 0 12pt;
+  font-size: 8.5pt;
+  color: #475569;
+}
+.chart-title {
+  font-size: 9.5pt;
+  font-weight: bold;
+  color: #1e40af;
+  margin-bottom: 6pt;
+}
+
+/* ── Conversation excerpts ── */
+.message-block {
+  margin-bottom: 10pt;
+  padding: 8pt 12pt;
+  border-radius: 4pt;
+  font-size: 9pt;
+  line-height: 1.55;
+}
+.message-user {
+  background: #f0f9ff;
+  border-left: 3pt solid #3b82f6;
+  color: #1e293b;
+}
+.message-assistant {
+  background: #f8fafc;
+  border-left: 3pt solid #0ea5e9;
+  color: #334155;
+}
+.message-role {
+  font-size: 7.5pt;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5pt;
+  color: #64748b;
+  margin-bottom: 3pt;
+}
+
+/* ── Page divider ── */
+.divider {
+  border: none;
+  border-top: 0.5pt solid #bfdbfe;
+  margin: 16pt 0;
+}
+
+/* ── Footer ── */
+.footer {
+  background: #0f172a;
+  color: #64748b;
+  font-size: 7pt;
+  padding: 8pt 48pt;
+  border-top: 2pt solid #1e40af;
+}
+"""
+
+
+def _build_html_report(*, session: dict, narrative: dict[str, Any]) -> str:
+    messages = session.get("messages", [])
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    asst_msgs = [m for m in messages if m.get("role") == "assistant"]
+    visual_payloads = _visual_payloads(messages)
+    generated_at = datetime.now().strftime("%B %d, %Y  %H:%M")
+    title = _esc(str(narrative.get("title") or session.get("title") or "DataSage Analytics Report"))
+
+    def bullet_section(heading: str, items: Any) -> str:
+        if isinstance(items, str):
+            items = [items]
+        rows = "".join(
+            f'<div class="bullet-item">&#8226;&nbsp; {_esc(str(item))}</div>'
+            for item in (items or ["No additional notes."])
+        )
+        return f'<div class="section-header">{heading}</div><div class="bullet-list">{rows}</div>'
+
+    def data_table_html(rows: list[dict]) -> str:
+        if not rows:
+            return ""
+        headers = list(rows[0].keys())[:6]
+        ths = "".join(f"<th>{_esc(h)}</th>" for h in headers)
+        trs = ""
+        for row in rows[:8]:
+            tds = "".join(f"<td>{_esc(_trunc(str(row.get(h, '')), 40))}</td>" for h in headers)
+            trs += f"<tr>{tds}</tr>"
+        return f'<table class="data-table"><tr>{ths}</tr>{trs}</table>'
+
+    # Stats badges
+    stats_html = (
+        f'<div class="stat-row">'
+        f'<span class="stat-badge">&#128172; {len(user_msgs)} user messages</span>'
+        f'<span class="stat-badge">&#129302; {len(asst_msgs)} AI responses</span>'
+        f'<span class="stat-badge">&#128202; {len(visual_payloads)} visualizations</span>'
+        f'</div>'
+    )
+
+    # Visualizations
+    viz_html = ""
+    if visual_payloads:
+        viz_html += '<div class="section-header">Visualizations &amp; Data</div>'
+        for idx, payload in enumerate(visual_payloads[:5], 1):
+            rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+            vtitle = _esc(_trunc(str(payload.get("summary") or payload.get("explanation") or f"Visualization {idx}"), 120))
+            chart_type = str(payload.get("chart_type") or "table").upper()
+            viz_html += f"""
+<div class="chart-placeholder">
+  <div class="chart-title">&#128202; {vtitle} <span style="font-size:7.5pt;color:#94a3b8;">[{chart_type}]</span></div>
+  {data_table_html(rows)}
+</div>"""
+
+    # Conversation excerpts (last 14 messages)
+    convo_html = '<div class="section-header">Conversation Excerpts</div>'
+    for msg in messages[-14:]:
+        role = str(msg.get("role") or "")
+        content = _esc(_trunc(str(msg.get("content") or ""), 800))
+        if role == "user":
+            convo_html += f'<div class="message-block message-user"><div class="message-role">&#128100; You</div>{content}</div>'
+        elif role == "assistant":
+            convo_html += f'<div class="message-block message-assistant"><div class="message-role">&#129302; DataSage AI</div>{content}</div>'
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>{REPORT_CSS}</style>
+</head>
+<body>
+
+<!-- COVER -->
+<div class="cover">
+  <div class="cover-brand">DataSage AI &bull; Analytics Report</div>
+  <div class="cover-title">{title}</div>
+  <div class="cover-subtitle">AI-Powered Data Analysis Summary</div>
+  {stats_html}
+  <div class="cover-meta">Generated on {generated_at} &bull; Confidential &bull; DataSage</div>
+</div>
+
+<div class="body-wrap">
+
+<!-- EXECUTIVE SUMMARY -->
+<div class="section-header">Executive Summary</div>
+<div class="summary-box">{_esc(str(narrative.get("executive_summary") or ""))}</div>
+
+{bullet_section("Key Findings", narrative.get("key_findings"))}
+<hr class="divider"/>
+{bullet_section("Recommendations", narrative.get("recommendations"))}
+<hr class="divider"/>
+{bullet_section("Limitations &amp; Notes", narrative.get("limitations"))}
+
+{viz_html}
+
+<hr class="divider"/>
+{convo_html}
+
+</div>
+
+<!-- FOOTER -->
+<div class="footer">
+  DataSage AI &bull; Confidential Analytics Report &bull; {generated_at}
+</div>
+
+</body>
+</html>"""
+    return html
+
+
+def _visual_payloads(messages: list[dict]) -> list[dict[str, Any]]:
+    payloads = []
+    for message in messages:
+        raw = message.get("viz_data")
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def _visual_summaries(messages: list[dict]) -> list[dict[str, Any]]:
+    summaries = []
+    for payload in _visual_payloads(messages):
+        rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        summaries.append({
+            "title": payload.get("summary") or payload.get("explanation"),
+            "chart_type": payload.get("chart_type"),
+            "row_count": len(rows),
+            "sample_rows": rows[:3],
+        })
+    return summaries
+
+
+def _esc(value: str) -> str:
+    return (
+        value
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _trunc(text: str, max_chars: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[:max_chars - 3].rstrip()}..."
 
 
 class ReportService:
@@ -140,16 +387,16 @@ class ReportService:
         messages = session.get("messages", [])
         if not messages:
             raise ValueError("This chat has no messages to report yet.")
-        user_message_count = sum(1 for message in messages if message.get("role") == "user")
+        user_message_count = sum(1 for m in messages if m.get("role") == "user")
         if user_message_count < MIN_REPORT_USER_MESSAGES:
             remaining = MIN_REPORT_USER_MESSAGES - user_message_count
             suffix = "" if remaining == 1 else "s"
             raise ValueError(f"Send {remaining} more message{suffix} before generating a report.")
 
         narrative = await self._generate_report_narrative(session)
-        pdf = self._build_pdf(session=session, narrative=narrative)
+        pdf_bytes = self._build_pdf(session=session, narrative=narrative)
         filename = self._safe_filename(str(session.get("title") or "datasage-report")) + ".pdf"
-        return pdf, filename
+        return pdf_bytes, filename
 
     async def _generate_report_narrative(self, session: dict) -> dict[str, Any]:
         if not self.settings.openrouter_report_api_key:
@@ -157,13 +404,14 @@ class ReportService:
         try:
             narrative = await self._generate_openrouter_narrative(session)
         except Exception as exc:
-            logger.warning("Falling back to local report narrative because OpenRouter report generation failed: %s", exc)
+            logger.warning("Falling back to local report narrative: %s", exc)
             return self._fallback_narrative(session)
         return self._normalize_narrative(narrative, session)
 
     async def _generate_openrouter_narrative(self, session: dict) -> dict[str, Any]:
-        transcript = self._compact_transcript(session.get("messages", []))
-        visuals = self._visual_summaries(session.get("messages", []))
+        messages = session.get("messages", [])
+        transcript = self._compact_transcript(messages)
+        visuals = _visual_summaries(messages)
         system_prompt = (
             "You generate concise analytics report content as JSON only. Do not copy the transcript as Q/A. "
             "Return keys: title, executive_summary, key_findings, recommendations, limitations. "
@@ -177,7 +425,7 @@ class ReportService:
             f"Transcript:\n{transcript}\n\n"
             f"Visualization summaries:\n{json.dumps(visuals, ensure_ascii=False)}"
         )
-        async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
@@ -202,30 +450,30 @@ class ReportService:
 
     def _fallback_narrative(self, session: dict) -> dict[str, Any]:
         messages = session.get("messages", [])
-        user_messages = [str(message.get("content") or "").strip() for message in messages if message.get("role") == "user"]
-        assistant_messages = [
-            str(message.get("content") or "").strip() for message in messages if message.get("role") == "assistant"
-        ]
-        visuals = self._visual_summaries(messages)
-        title = str(session.get("title") or "DataSage Report")
+        user_messages = [str(m.get("content") or "").strip() for m in messages if m.get("role") == "user"]
+        assistant_messages = [str(m.get("content") or "").strip() for m in messages if m.get("role") == "assistant"]
+        visuals = _visual_summaries(messages)
+        title = str(session.get("title") or "DataSage Analytics Report")
 
         summary_bits = [
-            f"This report summarizes a DataSage session with {len(user_messages)} user requests and {len(assistant_messages)} assistant responses.",
-            "The conversation focused on the user's data-analysis workflow, generated answers, charts or dashboard requests, and follow-up issues raised during the session.",
+            f"This report summarizes a DataSage session titled '{title}' comprising "
+            f"{len(user_messages)} user requests and {len(assistant_messages)} AI-generated responses.",
+            "The conversation focused on the connected data source, producing analytical answers, "
+            "chart queries, and data-driven insights.",
         ]
         if visuals:
-            summary_bits.append(f"The session produced {len(visuals)} visualization-ready result set{'s' if len(visuals) != 1 else ''}.")
+            suffix = "s" if len(visuals) != 1 else ""
+            summary_bits.append(
+                f"The session generated {len(visuals)} visualization-ready result set{suffix} suitable for dashboards."
+            )
 
         findings = []
-        for question in user_messages[-6:]:
-            findings.append(f"User explored: {self._truncate(question, 180)}")
-        for answer in assistant_messages[-4:]:
-            findings.append(f"Assistant outcome: {self._truncate(answer, 200)}")
-        if visuals:
-            for visual in visuals[:3]:
-                findings.append(
-                    f"Visualization captured: {self._truncate(str(visual.get('title') or 'Untitled visualization'), 160)}"
-                )
+        for q in user_messages[-6:]:
+            findings.append(f"User explored: {_trunc(q, 180)}")
+        for a in assistant_messages[-3:]:
+            findings.append(f"AI outcome: {_trunc(a, 200)}")
+        for v in visuals[:2]:
+            findings.append(f"Visualization: {_trunc(str(v.get('title') or 'Untitled'), 140)}")
 
         return self._normalize_narrative(
             {
@@ -233,23 +481,27 @@ class ReportService:
                 "executive_summary": " ".join(summary_bits),
                 "key_findings": findings[:10],
                 "recommendations": [
-                    "Review the generated findings against the source data before sharing externally.",
-                    "Ask follow-up questions with exact metrics, tables, companies, or periods where deeper analysis is needed.",
-                    "Regenerate the report after the session includes final validated charts and conclusions.",
+                    "Validate AI-generated findings against raw source data before sharing externally.",
+                    "Use exact column names, metrics, and time ranges in follow-up questions for precise results.",
+                    "Regenerate this report after resolving any low-confidence or failed queries noted above.",
                 ],
                 "limitations": [
-                    "This report is based only on the saved chat transcript and visualization payloads.",
-                    "If an analysis failed or was rate-limited, its final answer may be incomplete in the report.",
+                    "This report is derived solely from the saved chat transcript and visualization payloads.",
+                    "Rate-limited or failed queries may have incomplete answers reflected in the findings.",
+                    "AI interpretations are probabilistic; always verify critical numbers in the source system.",
                 ],
             },
             session,
         )
 
     def _normalize_narrative(self, narrative: dict[str, Any], session: dict) -> dict[str, Any]:
-        title = str(narrative.get("title") or session.get("title") or "DataSage Report")
+        title = str(narrative.get("title") or session.get("title") or "DataSage Analytics Report")
         executive_summary = str(narrative.get("executive_summary") or "").strip()
         if not executive_summary:
-            executive_summary = "This report summarizes the main analysis requests, responses, and follow-up items from the chat session."
+            executive_summary = (
+                "This report summarizes the main analysis requests, responses, and follow-up items "
+                "from the DataSage chat session."
+            )
 
         def listify(value: Any, fallback: str) -> list[str]:
             if isinstance(value, list):
@@ -264,128 +516,39 @@ class ReportService:
             "title": title,
             "executive_summary": executive_summary,
             "key_findings": listify(narrative.get("key_findings"), "No key findings were captured."),
-            "recommendations": listify(narrative.get("recommendations"), "Continue the analysis with a more specific follow-up question."),
+            "recommendations": listify(narrative.get("recommendations"), "Continue the analysis with a more specific question."),
             "limitations": listify(narrative.get("limitations"), "The report only uses information saved in this chat session."),
         }
 
     def _build_pdf(self, *, session: dict, narrative: dict[str, Any]) -> bytes:
+        try:
+            from xhtml2pdf import pisa  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "xhtml2pdf is not installed. Run: pip install xhtml2pdf"
+            ) from exc
+
+        html = _build_html_report(session=session, narrative=narrative)
         buffer = io.BytesIO()
-        styles = getSampleStyleSheet()
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=A4,
-            rightMargin=42,
-            leftMargin=42,
-            topMargin=42,
-            bottomMargin=42,
-            title=str(narrative.get("title") or session.get("title") or "DataSage Report"),
-        )
-        story: list[Any] = []
-
-        title = str(narrative.get("title") or session.get("title") or "DataSage Report")
-        story.append(Paragraph(title, styles["Title"]))
-        story.append(Spacer(1, 10))
-        story.append(Paragraph(str(narrative.get("executive_summary") or ""), styles["BodyText"]))
-        story.append(Spacer(1, 16))
-
-        self._add_bullet_section(story, styles, "Key Findings", narrative.get("key_findings"))
-        self._add_bullet_section(story, styles, "Recommendations", narrative.get("recommendations"))
-        self._add_bullet_section(story, styles, "Limitations", narrative.get("limitations"))
-
-        visual_payloads = self._visual_payloads(session.get("messages", []))
-        if visual_payloads:
-            story.append(PageBreak())
-            story.append(Paragraph("Visualizations", styles["Heading1"]))
-            for payload in visual_payloads[:4]:
-                rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
-                title_text = str(payload.get("summary") or payload.get("explanation") or "Visualization")
-                story.append(ReportChart(title_text, rows, payload.get("chart_type")))
-                story.append(Spacer(1, 10))
-                story.append(self._rows_table(rows[:6]))
-                story.append(Spacer(1, 18))
-
-        story.append(PageBreak())
-        story.append(Paragraph("Conversation Excerpts", styles["Heading1"]))
-        for message in session.get("messages", [])[-12:]:
-            role = str(message.get("role") or "").title()
-            content = self._truncate(str(message.get("content") or ""), 900)
-            story.append(Paragraph(f"<b>{role}</b>: {self._escape(content)}", styles["BodyText"]))
-            story.append(Spacer(1, 8))
-
-        doc.build(story)
-        return buffer.getvalue()
-
-    def _add_bullet_section(self, story: list[Any], styles: dict, title: str, items: Any) -> None:
-        story.append(Paragraph(title, styles["Heading1"]))
-        if isinstance(items, str):
-            items = [items]
-        for item in items or ["No additional notes."]:
-            story.append(Paragraph(f"- {self._escape(str(item))}", styles["BodyText"]))
-        story.append(Spacer(1, 14))
-
-    def _rows_table(self, rows: list[dict[str, Any]]) -> Table:
-        if not rows:
-            return Table([["No rows available"]])
-        headers = list(rows[0].keys())[:5]
-        data = [headers]
-        for row in rows:
-            data.append([self._truncate(str(row.get(header, "")), 40) for header in headers])
-        table = Table(data, repeatRows=1)
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2ff")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111827")),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ]
-            )
-        )
-        return table
+        result = pisa.CreatePDF(html, dest=buffer, encoding="utf-8")
+        if result.err:
+            logger.warning("xhtml2pdf reported %d error(s) during PDF generation.", result.err)
+        buffer.seek(0)
+        return buffer.read()
 
     def _compact_transcript(self, messages: list[dict]) -> str:
         lines = []
         for message in messages[-24:]:
             role = str(message.get("role") or "message")
-            content = self._truncate(str(message.get("content") or ""), 1000)
+            content = _trunc(str(message.get("content") or ""), 1000)
             lines.append(f"{role}: {content}")
         return "\n\n".join(lines)
-
-    def _visual_payloads(self, messages: list[dict]) -> list[dict[str, Any]]:
-        payloads = []
-        for message in messages:
-            raw = message.get("viz_data")
-            if not raw:
-                continue
-            try:
-                payload = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if isinstance(payload, dict):
-                payloads.append(payload)
-        return payloads
-
-    def _visual_summaries(self, messages: list[dict]) -> list[dict[str, Any]]:
-        summaries = []
-        for payload in self._visual_payloads(messages):
-            rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
-            summaries.append(
-                {
-                    "title": payload.get("summary") or payload.get("explanation"),
-                    "chart_type": payload.get("chart_type"),
-                    "row_count": len(rows),
-                    "sample_rows": rows[:3],
-                }
-            )
-        return summaries
 
     def _extract_json(self, text: str) -> dict[str, Any]:
         cleaned = text.strip()
         if "```" in cleaned:
-            parts = [part.strip() for part in cleaned.split("```") if part.strip()]
-            cleaned = next((part.removeprefix("json").strip() for part in parts if "{" in part), cleaned)
+            parts = [p.strip() for p in cleaned.split("```") if p.strip()]
+            cleaned = next((p.removeprefix("json").strip() for p in parts if "{" in p), cleaned)
         try:
             payload = json.loads(cleaned)
         except json.JSONDecodeError:
@@ -396,12 +559,3 @@ class ReportService:
     def _safe_filename(self, value: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-")
         return cleaned[:80] or "datasage-report"
-
-    def _truncate(self, text: str, max_chars: int) -> str:
-        normalized = " ".join(text.split())
-        if len(normalized) <= max_chars:
-            return normalized
-        return f"{normalized[: max_chars - 3].rstrip()}..."
-
-    def _escape(self, value: str) -> str:
-        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
