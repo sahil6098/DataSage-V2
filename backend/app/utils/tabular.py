@@ -22,15 +22,20 @@ def detect_source_type(path: Path) -> str:
 
 def _clean_table_name(name: str) -> str:
     cleaned = "".join(char if char.isalnum() or char == "_" else "_" for char in name.strip())
-    return cleaned.strip("_") or "data"
+    cleaned = cleaned.strip("_") or "data"
+    if cleaned[0].isdigit():
+        cleaned = f"table_{cleaned}"
+    return cleaned
 
 
-def load_tabular_source(path: Path) -> dict[str, pd.DataFrame]:
+def load_tabular_source(path: Path, display_name: str | None = None) -> dict[str, pd.DataFrame]:
     source_type = detect_source_type(path)
     if source_type == "csv":
-        return {_clean_table_name(path.stem): pd.read_csv(path)}
+        table_source = Path(display_name).stem if display_name else path.stem
+        return {_clean_table_name(table_source): pd.read_csv(path)}
     if source_type == "parquet":
-        return {_clean_table_name(path.stem): pd.read_parquet(path)}
+        table_source = Path(display_name).stem if display_name else path.stem
+        return {_clean_table_name(table_source): pd.read_parquet(path)}
     workbook = pd.read_excel(path, sheet_name=None)
     return {_clean_table_name(sheet_name): dataframe for sheet_name, dataframe in workbook.items()}
 

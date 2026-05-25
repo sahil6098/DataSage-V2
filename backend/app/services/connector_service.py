@@ -161,7 +161,7 @@ class ConnectorService:
         target_path = self.settings.upload_path / safe_name
         target_path.write_bytes(file_bytes)
 
-        schema = await self._build_file_schema(target_path)
+        schema = await self._build_file_schema(target_path, display_file_name=original_path.name)
         data_source = {
             "type": source_type,
             "database_name": None,
@@ -209,7 +209,7 @@ class ConnectorService:
             schema = await self._build_live_schema(parsed, data_source)
         else:
             file_path = Path(data_source["file_path"])
-            schema = await self._build_file_schema(file_path, data_source)
+            schema = await self._build_file_schema(file_path, data_source, display_file_name=data_source.get("file_name"))
 
         data_source["schema_cache"] = schema
         if schema.get("database_name"):
@@ -244,7 +244,7 @@ class ConnectorService:
                 row_limit,
             )
         else:
-            rows = await self._fetch_file_rows(Path(data_source["file_path"]), table_name, row_limit)
+            rows = await self._fetch_file_rows(Path(data_source["file_path"]), table_name, row_limit, data_source)
         return PreviewRowsResponse(table_name=table_name, rows=rows)
 
     async def update_schema_context(
@@ -341,10 +341,15 @@ class ConnectorService:
             raise ValueError("Unsupported data source type.")
         return self._apply_context(schema, data_source)
 
-    async def _build_file_schema(self, file_path: Path, data_source: dict | None = None) -> dict:
+    async def _build_file_schema(
+        self,
+        file_path: Path,
+        data_source: dict | None = None,
+        display_file_name: str | None = None,
+    ) -> dict:
         def _read():
             tables = []
-            for table_name, dataframe in load_tabular_source(file_path).items():
+            for table_name, dataframe in load_tabular_source(file_path, display_file_name).items():
                 field_map = (data_source or {}).get("field_descriptions", {}).get(table_name, {})
                 tables.append(
                     {
@@ -477,9 +482,15 @@ class ConnectorService:
         except PyMongoError as exc:
             raise ValueError(self._mongodb_error_message(exc)) from exc
 
-    async def _fetch_file_rows(self, file_path: Path, table_name: str, limit: int) -> list[dict]:
+    async def _fetch_file_rows(
+        self,
+        file_path: Path,
+        table_name: str,
+        limit: int,
+        data_source: dict | None = None,
+    ) -> list[dict]:
         def _read():
-            tables = load_tabular_source(file_path)
+            tables = self._load_file_tables_for_query(file_path, data_source)
             if table_name not in tables:
                 raise ValueError("Table not found in uploaded file.")
             return dataframe_rows(tables[table_name], limit)
@@ -560,7 +571,7 @@ class ConnectorService:
                     row_limit,
                 )
             else:
-                rows = await self._fetch_file_rows(Path(data_source["file_path"]), table_name, row_limit)
+                rows = await self._fetch_file_rows(Path(data_source["file_path"]), table_name, row_limit, data_source)
             samples[table_name] = rows
         return samples
 
@@ -580,13 +591,13 @@ class ConnectorService:
         return await asyncio.to_thread(_run)
 
     async def _run_file_query(self, data_source: dict, sql_query: str, row_limit: int) -> list[dict]:
-        query = self._validate_sql(sql_query)
+        query = self._prepare_file_sql_query(data_source, self._validate_sql(sql_query))
         file_path = Path(data_source["file_path"])
 
         def _run():
             connection = duckdb.connect(database=":memory:")
             try:
-                for table_name, dataframe in load_tabular_source(file_path).items():
+                for table_name, dataframe in self._load_file_tables_for_query(file_path, data_source).items():
                     connection.register(table_name, dataframe)
                 rows = connection.execute(query).fetch_df().head(row_limit)
                 return dataframe_rows(rows, row_limit)
@@ -984,6 +995,41 @@ class ConnectorService:
         if "Authentication failed" in message or "auth failed" in message.lower():
             return "MongoDB authentication failed. Check the username, password, and database permissions."
         return f"MongoDB query failed: {message}"
+
+    def _load_file_tables_for_query(self, file_path: Path, data_source: dict | None) -> dict[str, Any]:
+        tables = load_tabular_source(file_path, (data_source or {}).get("file_name"))
+        if len(tables) != 1:
+            return tables
+
+        dataframe = next(iter(tables.values()))
+        aliases = dict(tables)
+        for table in (data_source or {}).get("schema_cache", {}).get("tables", []):
+            table_name = table.get("name")
+            if table_name:
+                aliases[str(table_name)] = dataframe
+        return aliases
+
+    def _prepare_file_sql_query(self, data_source: dict, sql_query: str) -> str:
+        query = sql_query
+        table_names = {
+            str(table.get("name"))
+            for table in data_source.get("schema_cache", {}).get("tables", [])
+            if table.get("name")
+        }
+        table_names.update(
+            self._load_file_tables_for_query(Path(data_source["file_path"]), data_source).keys()
+        )
+        for table_name in sorted(table_names, key=len, reverse=True):
+            query = self._quote_unquoted_identifier(query, table_name)
+        return query
+
+    def _quote_unquoted_identifier(self, query: str, identifier: str) -> str:
+        if not identifier or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
+            return query
+
+        quoted = '"' + identifier.replace('"', '""') + '"'
+        pattern = re.compile(rf'(?<!["A-Za-z0-9_]){re.escape(identifier)}(?!["A-Za-z0-9_])')
+        return pattern.sub(quoted, query)
 
     def _validate_sql(self, sql_query: str) -> str:
         query = sql_query.strip().rstrip(";")

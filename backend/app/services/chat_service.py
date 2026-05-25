@@ -43,6 +43,8 @@ SQL_KEYWORDS = {
     "row_number", "rank", "dense_rank", "lag", "lead",
     "public", "table", "into", "values", "set", "using", "recursive",
     "fetch", "first", "next", "rows", "only", "percent", "ties",
+    "current_date", "current_timestamp", "current_time", "date_trunc",
+    "strftime", "strptime", "year", "month", "day",
 }
 
 
@@ -1581,6 +1583,8 @@ class ChatService:
                 state["data_source"],
             )
             payload = self._repair_mongodb_plan_for_schema(payload, question, state["data_source"])
+        else:
+            payload = self._repair_sql_plan_for_schema(payload, question, state["data_source"])
         payload["query_type"] = source_type if source_type == "mongodb" else "sql"
 
         # --- Tier 1A: Validate plan against schema ---
@@ -2138,6 +2142,129 @@ class ChatService:
             repaired[key] = self._replace_mongodb_field_aliases(raw_value, aliases)
         return repaired
 
+    def _repair_sql_plan_for_schema(self, query_plan: dict, question: str, data_source: dict) -> dict:
+        query = query_plan.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return query_plan
+
+        repaired = self._quote_sql_table_identifiers(query, data_source)
+        aliases = self._sql_field_aliases(data_source, question)
+        if aliases:
+            repaired = self._replace_sql_field_aliases(repaired, aliases)
+        if repaired != query:
+            logger.info("Repaired SQL query identifiers for selected schema.")
+            query_plan = {**query_plan, "query": repaired}
+        return query_plan
+
+    def _quote_sql_table_identifiers(self, query: str, data_source: dict) -> str:
+        repaired = query
+        table_names = {
+            str(table.get("name"))
+            for table in data_source.get("schema_cache", {}).get("tables", [])
+            if table.get("name")
+        }
+        for table_name in sorted(table_names, key=len, reverse=True):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+                continue
+            quoted = '"' + table_name.replace('"', '""') + '"'
+            pattern = re.compile(rf'(?<!["A-Za-z0-9_]){re.escape(table_name)}(?!["A-Za-z0-9_])')
+            repaired = pattern.sub(quoted, repaired)
+        return repaired
+
+    def _sql_field_aliases(self, data_source: dict, question: str) -> dict[str, str]:
+        fields = {
+            str(field.get("name"))
+            for table in data_source.get("schema_cache", {}).get("tables", [])
+            for field in table.get("fields", [])
+            if field.get("name")
+        }
+        lower_to_actual = {field.lower(): field for field in fields}
+
+        def first_existing(*candidates: str) -> str | None:
+            for candidate in candidates:
+                if candidate.lower() in lower_to_actual:
+                    return lower_to_actual[candidate.lower()]
+            return None
+
+        aliases: dict[str, str] = {}
+
+        def add(alias: str, *candidates: str) -> None:
+            if alias.lower() in lower_to_actual:
+                return
+            target = first_existing(*candidates)
+            if target:
+                aliases[alias.lower()] = target
+
+        q_tokens = self._text_tokens(question)
+        if "expense" in q_tokens or "expenses" in q_tokens:
+            add("status", "expense_status")
+            add("category", "expense_category")
+            add("amount", "amount")
+        elif "invoice" in q_tokens or "invoices" in q_tokens:
+            add("status", "invoice_status")
+            add("amount", "amount")
+        elif "transaction" in q_tokens or "transactions" in q_tokens or {"credit", "debit"}.intersection(q_tokens):
+            add("status", "transaction_status")
+            add("category", "transaction_category")
+            add("type", "transaction_type")
+        elif "employee" in q_tokens or "employees" in q_tokens or "salary" in q_tokens:
+            add("status", "emp_status")
+
+        for alias, candidates in {
+            "invoice_amount": ("amount",),
+            "invoice_total": ("amount",),
+            "expense_amount": ("amount",),
+            "expense_total": ("amount",),
+            "total_expense": ("amount",),
+            "total_expenses": ("amount",),
+            "total_amount": ("amount",),
+            "outstanding_amount": ("outstanding",),
+            "total_outstanding_amount": ("outstanding",),
+            "payroll_amount": ("net_salary", "salary"),
+            "total_payroll_amount": ("net_salary", "salary"),
+            "salary_payout": ("net_salary", "salary"),
+            "net_salary_payout": ("net_salary",),
+            "total_net_salary_payout": ("net_salary",),
+            "bonus_amount": ("bonus",),
+            "total_bonus": ("bonus",),
+            "client": ("client_name",),
+            "employee": ("employee_name",),
+            "department": ("department_name",),
+        }.items():
+            add(alias, *candidates)
+
+        return aliases
+
+    def _replace_sql_field_aliases(self, query: str, aliases: dict[str, str]) -> str:
+        string_spans = self._sql_string_spans(query)
+        output_aliases = self._extract_sql_aliases(query)
+        pattern = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+        def in_string(position: int) -> bool:
+            return any(start <= position < end for start, end in string_spans)
+
+        def replacement(match: re.Match[str]) -> str:
+            if in_string(match.start()):
+                return match.group(0)
+            token = match.group(0)
+            target = aliases.get(token.lower())
+            if not target:
+                return token
+            if token.lower() in output_aliases:
+                return token
+
+            before = query[: match.start()]
+            after = query[match.end() :]
+            if re.search(r"\bAS\s+$", before, flags=re.IGNORECASE):
+                return token
+            if re.match(r"\s*\(", after):
+                return token
+            if re.search(r"\.\s*$", before):
+                return token
+            return target
+
+        return pattern.sub(replacement, query)
+
     def _best_collection_for_mongo_refs(
         self,
         *,
@@ -2435,6 +2562,7 @@ class ChatService:
             query = query_plan.get("query", "")
             if query:
                 referenced = self._extract_sql_identifiers(query)
+                sql_aliases = self._extract_sql_aliases(query)
                 all_known_cols: set[str] = set()
                 for fields in known_fields.values():
                     all_known_cols.update(f.lower() for f in fields)
@@ -2446,6 +2574,7 @@ class ChatService:
                     if (
                         ident_lower not in all_known_cols
                         and ident_lower not in all_known_tables_lower
+                        and ident_lower not in sql_aliases
                         and ident_lower not in ignore_idents
                         and ident_lower not in SQL_KEYWORDS
                     ):
@@ -2459,11 +2588,39 @@ class ChatService:
         cleaned = re.sub(r"'[^']*'", "", query)
         # Remove numbers
         cleaned = re.sub(r"\b\d+(\.\d+)?\b", "", cleaned)
-        # Remove quoted identifiers but keep the name
-        cleaned = re.sub(r'"([^"]+)"', r"\1", cleaned)
+        quoted = set(re.findall(r'"([^"]+)"', cleaned))
+        cleaned = re.sub(r'"[^"]+"', " ", cleaned)
         # Extract word-like identifiers
         tokens = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", cleaned)
-        return {t for t in tokens if t.lower() not in SQL_KEYWORDS}
+        return {t for t in tokens if t.lower() not in SQL_KEYWORDS} | {
+            t for t in quoted if t.lower() not in SQL_KEYWORDS
+        }
+
+    def _extract_sql_aliases(self, query: str) -> set[str]:
+        cleaned = re.sub(r"'[^']*'", "", query)
+        cleaned = re.sub(r'"[^"]+"', " ", cleaned)
+        aliases = {
+            alias.lower()
+            for alias in re.findall(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", cleaned, flags=re.IGNORECASE)
+        }
+        aliases.update(
+            alias.lower()
+            for alias in re.findall(
+                r"\b(?:FROM|JOIN)\s+(?:[A-Za-z_][A-Za-z0-9_]*|\S+)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            if alias.lower() not in SQL_KEYWORDS
+        )
+        aliases.update(
+            alias.lower()
+            for alias in re.findall(r"\)\s+([A-Za-z_][A-Za-z0-9_]*)\b", cleaned)
+            if alias.lower() not in SQL_KEYWORDS
+        )
+        return aliases
+
+    def _sql_string_spans(self, query: str) -> list[tuple[int, int]]:
+        return [match.span() for match in re.finditer(r"'(?:''|[^'])*'", query)]
 
     def _extract_mongo_field_refs(self, pipeline: list) -> set[str]:
         """Extract field references (e.g. $fieldName) from a MongoDB pipeline."""
