@@ -260,13 +260,15 @@ class ChatService:
             execution_error = state.get("execution_error")
 
         if execution_error:
-            # Try LLM fallback for conversational / schema questions before giving error
+            # 3-tier fallback: follow-up resolution → conversational LLM → guided suggestions
             fallback = await self._try_conversational_fallback(
                 question=question,
                 data_source=state["data_source"],
                 schema_context=state["schema_context"],
                 memory_context=state.get("memory_context", ""),
                 provider_preference=state.get("provider_used") or state.get("provider_preference"),
+                user_id=user_id,
+                session_id=session_id,
             )
             if fallback:
                 async for event in self._stream_prebuilt_reply(
@@ -274,6 +276,7 @@ class ChatService:
                     session_id=session_id,
                     question=question,
                     message=fallback,
+                    intent_type="conversational",
                 ):
                     yield event
                 return
@@ -289,26 +292,20 @@ class ChatService:
 
         rows = state.get("result_rows", [])
         if not rows:
-            # Try LLM fallback for questions that didn't yield data rows
+            # 3-tier fallback: always produces a helpful answer, never a silent failure
             fallback = await self._try_conversational_fallback(
                 question=question,
                 data_source=state["data_source"],
                 schema_context=state["schema_context"],
                 memory_context=state.get("memory_context", ""),
                 provider_preference=state.get("provider_used") or state.get("provider_preference"),
+                user_id=user_id,
+                session_id=session_id,
             )
-            if fallback:
-                async for event in self._stream_prebuilt_reply(
-                    user_id=user_id,
-                    session_id=session_id,
-                    question=question,
-                    message=fallback,
-                ):
-                    yield event
-                return
-            empty_message = "I could not find matching rows for that question in the connected source."
-            if state.get("low_confidence"):
-                empty_message += (
+            # fallback is always non-None now (Tier C guarantees a local answer)
+            reply = fallback or "I could not find matching rows for that question in the connected source."
+            if not fallback and state.get("low_confidence"):
+                reply += (
                     "\n\nNote: the analysis model had low confidence in the generated query. "
                     "Try rephrasing your question or check that the right tables and columns are selected."
                 )
@@ -316,7 +313,8 @@ class ChatService:
                 user_id=user_id,
                 session_id=session_id,
                 question=question,
-                message=empty_message,
+                message=reply,
+                intent_type="conversational" if fallback else None,
             ):
                 yield event
             return
@@ -416,12 +414,28 @@ class ChatService:
             plan_to_cache = {**state["query_plan"], "_cached_provider": state.get("provider_used")}
             self.query_cache.put(question, schema_context, plan_to_cache)
 
+        # Extract tables used from the query plan for memory tagging
+        _plan = state["query_plan"]
+        _tables_used: list[str] = []
+        if _plan.get("collection"):
+            _tables_used = [str(_plan["collection"])]
+        elif _plan.get("query"):
+            # Extract FROM/JOIN table names from SQL
+            _tables_used = self._extract_sql_tables(_plan["query"], state["data_source"])
+
         await self._append_turn(
             user_id=user_id,
             session_id=session_id,
             question=question,
             message=message,
             viz_data=viz_data,
+            tables_used=_tables_used or None,
+            intent_type="analytical",
+        )
+        # Stamp last_used_at on the data source so the sessions list
+        # shows when this connection was most recently queried.
+        asyncio.ensure_future(
+            self.session_service.touch_data_source_last_used(user_id, session_id)
         )
 
         yield {
@@ -721,6 +735,66 @@ class ChatService:
                     "comparison, anomaly, or chart from the selected tables."
                 )
             return "I am focused on data analysis. Connect a source first, then ask about its schema, rows, or trends."
+
+        # ── Coding / programming requests ──────────────────────────────────
+        coding_patterns = (
+            r"\b(give me|write|show me|generate|create|make).{0,30}\b(code|program|script|function|class|snippet|algorithm)\b",
+            r"\b(code for|program for|implement|how to code|coding question)\b",
+            r"\b(python|java|javascript|typescript|c\+\+|golang|rust|kotlin|swift|php|ruby|sql script)\b.{0,20}\b(code|program|example|snippet|function|class)\b",
+            r"\b(sort algorithm|sorting|linked list|binary tree|recursion|dynamic programming|big o|complexity)\b",
+        )
+        if any(re.search(p, normalized) for p in coding_patterns):
+            return (
+                "I'm a data-analysis assistant and I can't help with coding questions. "
+                + ("Ask me something about the connected data instead — counts, trends, comparisons, or charts."
+                   if has_data_source
+                   else "Connect a data source and ask me about its rows, fields, or trends.")
+            )
+
+        # ── Poetry / creative writing requests ────────────────────────────
+        poetry_patterns = (
+            r"\b(write|give me|create|make|compose).{0,20}\b(poem|poetry|song|lyrics|story|essay|haiku|limerick|ballad|ode)\b",
+            r"\b(poem on|poem about|write me a|sing me a)\b",
+        )
+        if any(re.search(p, normalized) for p in poetry_patterns):
+            return (
+                "I'm a data-analysis assistant — I can't write poems or creative content. "
+                + ("Ask me a question about the connected data instead."
+                   if has_data_source
+                   else "Connect a data source and ask me about its rows or trends.")
+            )
+
+        # ── General knowledge / current-events questions ───────────────────
+        general_knowledge_patterns = (
+            r"\b(who won|who is|who was|what is the capital|how old is|when did|where is|which country|which team)\b",
+            r"\b(ipl|cricket|football|soccer|nba|nfl|world cup|olympics|match|tournament|championship|league)\b",
+            r"\b(recipe|cook|ingredient|restaurant|food|meal|dinner|lunch|breakfast)\b.{0,15}\b(for me|us|tonight|today)\b",
+            r"^(can we|lets|let us|shall we).{0,30}\b(go|eat|meet|hang|watch|play)\b",
+            r"\b(are you male|are you female|are you a (man|woman|human|robot|ai|bot)|what gender|your age|how old are you)\b",
+            r"\b(love poem|romantic|relationship advice|date me|marry me|i love you)\b",
+            r"\b(who is your (dad|daddy|father|creator|owner|boss|maker))\b",
+        )
+        if any(re.search(p, normalized) for p in general_knowledge_patterns):
+            return (
+                "I'm DataSage — a data-analysis assistant. I can only answer questions about the data in your session. "
+                + ("Ask me about counts, trends, comparisons, or any metric from the connected source."
+                   if has_data_source
+                   else "Connect a data source first, then ask me about its rows, fields, or trends.")
+            )
+
+        # ── Connection-string / credential extraction attempts ─────────────
+        credential_patterns = (
+            r"\b(connection string|raw connection|db uri|database url|password|credentials|api key|secret key)\b",
+            r"\b(return|show|give|print|reveal).{0,20}\b(connection|credentials|secrets|keys)\b",
+            r"\b(pg_database|information_schema.*password|pg_shadow|pg_user)\b",
+        )
+        if any(re.search(p, normalized) for p in credential_patterns):
+            return (
+                "I can't expose connection strings, credentials, or internal configuration. "
+                + ("Ask me a data question about the connected source instead."
+                   if has_data_source
+                   else "Connect a data source and ask about its schema or data.")
+            )
 
         return None
 
@@ -1570,6 +1644,8 @@ class ChatService:
         question: str,
         message: str,
         viz_data: str | None = None,
+        tables_used: list[str] | None = None,
+        intent_type: str | None = None,
     ) -> None:
         now = ist_now()
         await self.session_service.append_messages(
@@ -1583,6 +1659,8 @@ class ChatService:
             session_id=session_id,
             question=question,
             answer=message,
+            tables_used=tables_used,
+            intent_type=intent_type,
         )
 
     async def _stream_prebuilt_reply(
@@ -1593,6 +1671,7 @@ class ChatService:
         question: str,
         message: str,
         viz_data: str | None = None,
+        intent_type: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         yield self._stage_event("generating", "Generating insight")
         for chunk in self._split_stream_text(message):
@@ -1605,11 +1684,12 @@ class ChatService:
             question=question,
             message=message,
             viz_data=viz_data,
+            intent_type=intent_type,
         )
         yield {"type": "final", "payload": {"message": message, "viz_data": viz_data}}
 
     # ------------------------------------------------------------------ #
-    #  Conversational fallback: handles questions that don't need a query #
+    #  3-Tier Fallback: query failed or returned no rows                  #
     # ------------------------------------------------------------------ #
 
     async def _try_conversational_fallback(
@@ -1620,91 +1700,222 @@ class ChatService:
         schema_context: str,
         memory_context: str,
         provider_preference: str | None,
+        user_id: str = "",
+        session_id: str = "",
     ) -> str | None:
         """
-        When the query pipeline fails or returns no rows, check if the question
-        is actually conversational/explanatory rather than analytical. If so,
-        answer it directly using LLM + schema context instead of forcing a query.
-        Returns an answer string or None if the question should remain a query failure.
+        3-tier fallback called when query execution fails or returns 0 rows.
+
+        Tier A — Follow-up resolution:
+            Detects pronoun/reference questions ("same for X", "but only for Q3").
+            Injects the most recent structured turn to help the LLM resolve the
+            reference and answer without a DB query.
+
+        Tier B — Full conversational LLM answer:
+            Always attempted. Sends schema + full structured recent turns + current
+            question. The LLM answers conversationally, explains what it *can* do,
+            or resolves the follow-up using conversation history.
+
+        Tier C — Guided suggestions (local, no LLM):
+            If the LLM call fails entirely, build a deterministic answer listing
+            what the connected schema supports so the user is never left with a
+            silent failure.
         """
-        # Only use fallback for clearly non-analytical or follow-up questions
-        if not self._is_conversational_or_followup(question):
-            return None
+        schema_summary = self._truncate_text(schema_context, 3_200)
 
-        schema_summary = self._truncate_text(schema_context, 3000)
-        memory_snippet = self._truncate_text(memory_context, 1000) if memory_context else ""
+        # ── Build structured recent-turn block from memory service ──────
+        recent_turns_block = self._truncate_text(memory_context, 2_500) if memory_context else ""
 
+        # ── Tier A: follow-up / pronoun resolution ──────────────────────
+        if self._is_followup_question(question) and recent_turns_block:
+            tier_a_answer = await self._tier_a_followup_answer(
+                question=question,
+                recent_turns_block=recent_turns_block,
+                schema_summary=schema_summary,
+                provider_preference=provider_preference,
+            )
+            if tier_a_answer:
+                return tier_a_answer
+
+        # ── Tier B: full conversational LLM answer ───────────────────────
+        tier_b_answer = await self._tier_b_conversational_answer(
+            question=question,
+            schema_summary=schema_summary,
+            recent_turns_block=recent_turns_block,
+            provider_preference=provider_preference,
+        )
+        if tier_b_answer:
+            return tier_b_answer
+
+        # ── Tier C: local guided suggestions (never fails) ───────────────
+        return self._tier_c_guided_suggestions(question, data_source)
+
+    # ── Tier A ──────────────────────────────────────────────────────────
+
+    def _is_followup_question(self, question: str) -> bool:
+        """Detect questions that reference a prior turn via pronoun or partial phrase."""
+        normalized = question.lower().strip()
+        followup_patterns = (
+            r"\b(same|same (as|for|thing|chart|query|analysis|result)|again|as before)\b",
+            r"\b(it|that|those|this|them|these)\b.{0,25}\b(for|in|with|by|from)\b",
+            r"\b(now (show|give|do|get)|but (only|for|with|filter)|also (show|add|include))\b",
+            r"\b(previous|last|prior|earlier) (result|answer|analysis|query|chart)\b",
+            r"\b(continue|follow.?up|next step|what (else|next|about))\b",
+            r"\b(only for|just for|specifically for|instead|rather|not .{0,20} but)\b",
+            r"^(and|but|also|what about|how about|now) ",
+        )
+        return any(re.search(p, normalized) for p in followup_patterns)
+
+    async def _tier_a_followup_answer(
+        self,
+        *,
+        question: str,
+        recent_turns_block: str,
+        schema_summary: str,
+        provider_preference: str | None,
+    ) -> str | None:
         system_prompt = (
-            "You are DataSage, a helpful data analysis assistant. "
-            "The user has a data source connected. You have access to the schema of that data source. "
-            "Answer the user's question conversationally using the schema context provided. "
-            "If the question asks what analyses are possible, suggest 3-5 specific, actionable questions "
-            "they can ask based on the actual tables and fields in the schema. "
-            "If the question is a follow-up or clarification from the conversation, answer it clearly. "
-            "Keep your answer concise and helpful. Do not fabricate data values. "
-            "Do not mention JSON, SQL, MongoDB, pipelines, or internal implementation details."
+            "You are DataSage, a precise data-analysis assistant. "
+            "The user is asking a follow-up question that references a previous turn. "
+            "Use the RECENT TURNS context to understand what the user is referring to "
+            "(e.g., 'it', 'same', 'that result', 'but only for X'). "
+            "Resolve the reference and provide a direct, useful answer. "
+            "If the follow-up requires new data you cannot produce without a query, "
+            "explain clearly what you understood they want and suggest how to rephrase. "
+            "Do not mention SQL, MongoDB, JSON, pipelines, or internal implementation details. "
+            "Do not fabricate numbers."
         )
         user_prompt = (
-            f"User question: {question}\n\n"
+            f"Current question: {question}\n\n"
+            f"{recent_turns_block}\n\n"
             f"Connected data schema:\n{schema_summary}"
         )
-        if memory_snippet:
-            user_prompt += f"\n\nRecent conversation context:\n{memory_snippet}"
+        try:
+            answer, _ = await self.llm_service.invoke_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                preferred_provider=provider_preference,
+                max_output_tokens=420,
+            )
+            answer = answer.strip()
+            if len(answer) > 30:
+                logger.info("Tier-A follow-up fallback answered: %s", question[:80])
+                return answer
+        except Exception as exc:
+            logger.warning("Tier-A fallback failed: %s", exc)
+        return None
+
+    # ── Tier B ──────────────────────────────────────────────────────────
+
+    async def _tier_b_conversational_answer(
+        self,
+        *,
+        question: str,
+        schema_summary: str,
+        recent_turns_block: str,
+        provider_preference: str | None,
+    ) -> str | None:
+        system_prompt = (
+            "You are DataSage, a helpful data-analysis assistant. "
+            "A query was attempted for the user's question but either failed or returned no results. "
+            "Your job is to still be maximally helpful. You may: "
+            "(1) answer the question conversationally using the schema and conversation history; "
+            "(2) explain what data IS available and what questions it CAN answer; "
+            "(3) suggest 2-4 concrete, rephrased questions the user could ask that the schema supports. "
+            "Always resolve pronouns and references (like 'it', 'same', 'that table') using the "
+            "RECENT TURNS context before responding. "
+            "Be direct, specific, and useful. Never say you cannot help. "
+            "Do not mention SQL, MongoDB, JSON, pipelines, or internal technical details. "
+            "Do not fabricate data values or row counts."
+        )
+        user_prompt_parts = [f"User question: {question}", ""]
+        if recent_turns_block:
+            user_prompt_parts.append(recent_turns_block)
+            user_prompt_parts.append("")
+        user_prompt_parts.append(f"Connected data schema:\n{schema_summary}")
+        user_prompt = "\n".join(user_prompt_parts)
 
         try:
             answer, _ = await self.llm_service.invoke_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 preferred_provider=provider_preference,
-                max_output_tokens=400,
+                max_output_tokens=480,
             )
             answer = answer.strip()
             if len(answer) > 30:
-                logger.info("Conversational fallback answered question: %s", question[:80])
+                logger.info("Tier-B conversational fallback answered: %s", question[:80])
                 return answer
         except Exception as exc:
-            logger.warning("Conversational fallback LLM call failed: %s", exc)
-
+            logger.warning("Tier-B fallback failed: %s", exc)
         return None
 
-    def _is_conversational_or_followup(self, question: str) -> bool:
-        """Return True if the question is likely conversational rather than a pure data query."""
-        normalized = question.lower().strip()
+    # ── Tier C ──────────────────────────────────────────────────────────
 
-        # Clear analytical signals — let the pipeline handle these, don't fallback
-        analytical_patterns = (
-            r"\b(count|total|sum|average|avg|max|min|top|bottom|rank|highest|lowest|how many|how much)\b",
-            r"\b(show me|give me|list|find|get|fetch|retrieve)\b.{0,30}\b(record|row|data|result|entry|entries)\b",
-            r"\b(group by|grouped by|by \w+|per \w+|for each|breakdown)\b",
-            r"\b(trend|over time|monthly|quarterly|yearly|by month|by year|last \d+)\b",
-            r"\b(compare|comparison|vs|versus|against|difference between)\b",
-            r"\b(filter|where|with status|having|greater than|less than|equal to)\b",
-        )
-        for pattern in analytical_patterns:
-            if re.search(pattern, normalized):
-                return False
+    def _tier_c_guided_suggestions(self, question: str, data_source: dict) -> str:
+        """
+        Deterministic local answer — never fails. Lists what the schema supports
+        and suggests concrete questions so the user always gets a useful response.
+        """
+        schema = data_source.get("schema_cache", {})
+        selected = set(data_source.get("selected_tables", []))
+        tables = [
+            t for t in schema.get("tables", [])
+            if not selected or t.get("name") in selected
+        ]
 
-        # Conversational / exploratory signals — use LLM fallback
-        conversational_patterns = (
-            r"\b(what can (i|you)|what (should|could) i ask|what (questions|analysis) (can|could|should))\b",
-            r"\b(how (do|can|should) i|help me understand|explain|tell me about|what does this (data|table|field))\b",
-            r"\b(what (is|are) the|can you explain|give me an overview|summarize the (data|dataset|schema))\b",
-            r"\b(what (information|insights|patterns) (is|are|can))\b",
-            r"\b(analyze this|analyze the data|give me insights|what (do you|can you) see)\b",
-            r"\b(is there|are there|do (we|you) have|does (this|the) (data|table|collection))\b",
-            r"\b(previous|last|before|earlier|again|same|as before|that (question|analysis)|follow.?up)\b",
-            r"\b(which (table|collection|field|column)|what (table|field|column))\b",
-        )
-        for pattern in conversational_patterns:
-            if re.search(pattern, normalized):
-                return True
+        lines = [
+            "I couldn't find matching data for that question in the connected source, "
+            "but here's what I can help you explore:",
+            "",
+        ]
+        suggestions: list[str] = []
+        for table in tables[:4]:
+            name = str(table.get("name", ""))
+            fields = [str(f.get("name")) for f in table.get("fields", []) if f.get("name")]
+            numeric = [
+                f for f in fields
+                if any(k in f.lower() for k in ("amount", "revenue", "count", "total", "price",
+                                                  "cost", "qty", "quantity", "score", "value"))
+            ]
+            cat = [
+                f for f in fields
+                if any(k in f.lower() for k in ("status", "type", "category", "region",
+                                                  "segment", "tier", "name", "label"))
+            ]
+            if numeric:
+                suggestions.append(
+                    f"- Total or average **{numeric[0]}** from **{name}**"
+                    + (f" grouped by **{cat[0]}**" if cat else "")
+                )
+            if cat and len(suggestions) < 4:
+                suggestions.append(
+                    f"- Count of records in **{name}** by **{cat[0]}**"
+                )
+            if fields and len(suggestions) < 4:
+                date_fields = [f for f in fields if any(
+                    k in f.lower() for k in ("date", "month", "year", "period", "time")
+                )]
+                if date_fields and numeric:
+                    suggestions.append(
+                        f"- Trend of **{numeric[0]}** over time in **{name}**"
+                    )
 
-        # Short questions (under 6 words) that aren't clearly analytical
-        words = normalized.split()
-        if len(words) <= 6:
-            return True
+        if suggestions:
+            lines.extend(suggestions[:4])
+        else:
+            # Absolute last resort — just list table names
+            table_names = [str(t.get("name", "")) for t in tables[:6] if t.get("name")]
+            if table_names:
+                lines.append("You can ask questions about these tables: " + ", ".join(table_names) + ".")
+            else:
+                lines.append("Connect or select tables to start exploring your data.")
 
-        return False
+        lines.extend([
+            "",
+            "Try rephrasing your question or ask for a count, trend, or comparison from the tables above.",
+        ])
+        return "\n".join(lines)
 
     def _build_graph(self):
         graph = StateGraph(AnalysisState)
@@ -2049,12 +2260,16 @@ class ChatService:
         base = (
             f"You write safe read-only {dialect} SELECT queries for analytics. "
             "Return JSON only. Keys: query, chart_type, notes, confidence. "
-            "CRITICAL RULE 1: Only use table and column names that EXIST in the schema context provided. "
-            "Do not invent table names, column aliases, or synonyms not in the schema. "
-            "CRITICAL RULE 2: Only SELECT or WITH (CTE) queries. Never INSERT, UPDATE, DELETE, DROP, or CREATE. "
-            "CRITICAL RULE 3: Quote table/column identifiers with double-quotes when they contain spaces, "
+            "CRITICAL RULE 1: Only use table and column names that EXIST VERBATIM in the schema context provided. "
+            "Do not invent, guess, or abbreviate table names, column names, or use synonyms not listed in the schema. "
+            "If a column does not appear in the schema, do NOT include it anywhere in the query. "
+            "CRITICAL RULE 2: NEVER use table aliases. Always reference tables by their full exact name from the schema. "
+            "For example, write 'SELECT departments.name FROM departments' NOT 'SELECT d.name FROM departments d'. "
+            "Every column reference must use the full table name or no qualifier — never a single-letter or short alias. "
+            "CRITICAL RULE 3: Only SELECT or WITH (CTE) queries. Never INSERT, UPDATE, DELETE, DROP, TRUNCATE, or CREATE. "
+            "CRITICAL RULE 4: Quote table/column identifiers with double-quotes when they contain spaces, "
             "mixed case, or special characters. "
-            "CRITICAL RULE 4: For ambiguous or general questions, produce a reasonable best-effort SELECT "
+            "CRITICAL RULE 5: For ambiguous or general questions, produce a reasonable best-effort SELECT "
             "query grouping or counting the most relevant columns. Do not refuse — always attempt a query. "
             "Set confidence='medium' and explain your approach in notes. "
             "When the result would expose raw ID columns, JOIN with the related table to get readable names instead. "
@@ -2071,18 +2286,41 @@ class ChatService:
                 "Use double quotes for column names with spaces, mixed case, or special characters. "
                 "Do not reference information_schema or pg_catalog. "
                 "Use ILIKE for case-insensitive string matching. "
-                "Date functions: DATE_TRUNC('month', col), DATE_PART('year', col), STRFTIME(col, '%Y-%m')."
+                "Date functions: use CAST(col AS DATE) before DATE_TRUNC, e.g. DATE_TRUNC('month', CAST(col AS DATE)); "
+                "for STRFTIME use CAST explicitly: STRFTIME(CAST(col AS TIMESTAMP), '%Y-%m'); "
+                "for date differences use DATEDIFF('day', CAST(date1 AS DATE), CAST(date2 AS DATE))."
+            )
+        else:
+            base += (
+                " PostgreSQL-SPECIFIC RULES: "
+                "Use standard PostgreSQL date functions: DATE_TRUNC('month', col::timestamp), "
+                "EXTRACT(YEAR FROM col::timestamp), TO_CHAR(col::timestamp, 'YYYY-MM'). "
+                "For date differences use (col2::date - col1::date) which returns an integer number of days."
             )
         return base
 
     def _rows_are_chartable(self, rows: list[dict]) -> bool:
-        if len(rows) < 2:
+        """
+        A result is chartable when it has 2+ rows and at least one column
+        contains numeric data.  Handles values that are ints, floats, or
+        numeric strings (common with PostgreSQL Decimal / DuckDB varchar casts).
+        Single-row results are allowed when the user explicitly asked for a
+        chart (caller decides); here we check structural chartability only.
+        """
+        if not rows:
             return False
-        numeric_keys = set()
+        numeric_keys: set[str] = set()
         for row in rows:
             for key, value in row.items():
                 if isinstance(value, (int, float)):
                     numeric_keys.add(key)
+                elif isinstance(value, str):
+                    # Accept strings that are purely numeric (Decimal/coerced)
+                    stripped = value.strip().lstrip("-+")
+                    if stripped and stripped.replace(".", "", 1).isdigit():
+                        numeric_keys.add(key)
+        # Need at least one numeric column; relax the 2-row minimum for
+        # explicit single-result charts (e.g. "show total revenue as a gauge")
         return bool(numeric_keys)
 
     def _answer_prompt(self) -> str:
@@ -2123,6 +2361,27 @@ class ChatService:
             prompt += f"\n\n{self._truncate_text(memory_context, MAX_MEMORY_CONTEXT_CHARS)}"
         return prompt
 
+    def _coerce_numeric_row_values(self, rows: list[dict]) -> list[dict]:
+        """
+        Coerce string-represented numeric values to float so chart libraries
+        always receive real numbers.  Leaves non-numeric strings untouched.
+        """
+        coerced: list[dict] = []
+        for row in rows:
+            new_row: dict = {}
+            for key, value in row.items():
+                if isinstance(value, str):
+                    stripped = value.strip().lstrip("-+")
+                    if stripped and stripped.replace(".", "", 1).isdigit():
+                        try:
+                            new_row[key] = float(value.strip())
+                            continue
+                        except (ValueError, OverflowError):
+                            pass
+                new_row[key] = value
+            coerced.append(new_row)
+        return coerced
+
     def _build_viz_data(
         self,
         *,
@@ -2133,6 +2392,8 @@ class ChatService:
     ) -> str | None:
         if not self._user_requested_visualization(question):
             return None
+        if not rows:
+            return None
         if not self._rows_are_chartable(rows):
             return None
 
@@ -2140,8 +2401,12 @@ class ChatService:
         if not query_preview and query_plan.get("pipeline") is not None:
             query_preview = json.dumps(query_plan["pipeline"], ensure_ascii=False)
 
+        # Coerce string-numeric values to float so the chart renderer always
+        # receives proper numbers (fixes Decimal/string-coerced DB driver output)
+        chart_rows = self._coerce_numeric_row_values(rows)
+
         viz_payload = {
-            "rows": rows,
+            "rows": chart_rows,
             "chart_type": query_plan.get("chart_type") or "bar",
             "explanation": answer,
             "query": query_preview,
@@ -2151,14 +2416,29 @@ class ChatService:
         return json.dumps(viz_payload, ensure_ascii=False)
 
     def _user_requested_visualization(self, question: str) -> bool:
+        """
+        Detect explicit chart/graph requests including natural follow-up phrasings.
+        Checks both the current question and common follow-up patterns so that
+        'now show it as a chart' or 'can you make a graph of that' are caught.
+        """
         normalized = question.lower()
-        return bool(
-            re.search(
-                r"\b(chart|graph|plot|visuali[sz]e|visuali[sz]ation|dashboard|bar chart|line chart|pie chart|donut|"
-                r"scatter|histogram|heatmap|trend chart|draw|show.*chart|show.*graph)\b",
-                normalized,
-            )
+        # Primary: explicit visualization keywords
+        if re.search(
+            r"\b(chart|graph|plot|visuali[sz]e|visuali[sz]ation|dashboard|"
+            r"bar chart|line chart|pie chart|donut chart|scatter|scatter plot|"
+            r"histogram|heatmap|trend chart|gauge)\b",
+            normalized,
+        ):
+            return True
+        # Secondary: natural follow-up phrasings
+        followup_viz_patterns = (
+            r"\b(show|display|give|make|create|draw|render|put).{0,30}\b(chart|graph|plot|visual|diagram)\b",
+            r"\b(as a|in a|as an|into a).{0,15}\b(chart|graph|plot|bar|line|pie|donut|visual)\b",
+            r"\b(can you|could you|please).{0,20}\b(chart|graph|plot|visualize|visualise|draw)\b",
+            r"\b(show (it|this|that|them|the result|the data)).{0,20}\b(visually|graphically|as a chart|as a graph)\b",
+            r"\bplot (it|this|that|them|the result|the data)\b",
         )
+        return any(re.search(p, normalized) for p in followup_viz_patterns)
 
     def _compact_question(self, question: str) -> str:
         normalized = " ".join(question.split()).rstrip(" ?")
@@ -2198,6 +2478,28 @@ class ChatService:
         if len(text) <= max_chars:
             return text
         return f"{text[: max_chars - 3].rstrip()}..."
+
+    def _extract_sql_tables(self, query: str, data_source: dict) -> list[str]:
+        """
+        Extract table names referenced in a SQL query by matching known schema
+        table names against FROM / JOIN clauses.  Returns only names that exist
+        in the data source schema so we never store invented names.
+        """
+        known = {
+            str(t.get("name")).lower(): str(t.get("name"))
+            for t in data_source.get("schema_cache", {}).get("tables", [])
+            if t.get("name")
+        }
+        if not known:
+            return []
+        found: list[str] = []
+        # Strip quoted identifiers to plain text for matching
+        clean = re.sub(r'"([^"]+)"', lambda m: m.group(1), query)
+        for token in re.split(r"[\s,;()]+", clean):
+            lower_tok = token.lower().strip(".")
+            if lower_tok in known and known[lower_tok] not in found:
+                found.append(known[lower_tok])
+        return found
 
     def _split_stream_text(self, text: str, chunk_size: int = 160) -> list[str]:
         if not text:

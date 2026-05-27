@@ -3,7 +3,7 @@ import re
 from bson import ObjectId
 
 from app.db.mongo import get_database
-from app.schemas.session import MessageOut, SessionCreateRequest, SessionDetailOut, SessionOut, SourceConfigOut
+from app.schemas.session import DataSourceInfoOut, MessageOut, SessionCreateRequest, SessionDetailOut, SessionOut, SourceConfigOut
 from app.utils.time import ist_now
 
 
@@ -94,6 +94,21 @@ class SessionService:
         session = await self._fetch_owned_session(user_id, session_id)
         return list(session.get("messages", []))
 
+    async def disconnect_all_user_sessions(self, user_id: str) -> None:
+        """Null out data_source on every session for this user (called on logout)."""
+        await self.db.sessions.update_many(
+            {"user_id": user_id, "data_source": {"$ne": None}},
+            {"$set": {"data_source": None, "updated_at": ist_now()}},
+        )
+
+    async def touch_data_source_last_used(self, user_id: str, session_id: str) -> None:
+        """Stamp data_source.last_used_at with current time after a successful query."""
+        now = ist_now()
+        await self.db.sessions.update_one(
+            {"_id": ObjectId(session_id), "user_id": user_id, "data_source": {"$ne": None}},
+            {"$set": {"data_source.last_used_at": now, "updated_at": now}},
+        )
+
     async def _fetch_owned_session(self, user_id: str, session_id: str) -> dict:
         session = await self.db.sessions.find_one({"_id": ObjectId(session_id), "user_id": user_id})
         if not session:
@@ -106,6 +121,24 @@ class SessionService:
             content=message["content"],
             viz_data=message.get("viz_data"),
             created_at=message.get("created_at"),
+        )
+
+    def _data_source_info_out(self, source: dict | None) -> DataSourceInfoOut | None:
+        """Build a lightweight session-card summary from an embedded data_source dict."""
+        if not source:
+            return None
+        source_type = source.get("type", "")
+        # Prefer database_name; fall back to file_name
+        display_name = (
+            source.get("database_name")
+            or source.get("file_name")
+            or source_type
+        )
+        return DataSourceInfoOut(
+            type=source_type,
+            display_name=str(display_name),
+            masked_uri=source.get("connection_uri_masked"),
+            last_used_at=source.get("last_used_at"),
         )
 
     def _source_out(self, source: dict | None) -> SourceConfigOut | None:
@@ -129,6 +162,7 @@ class SessionService:
             draft=bool(session.get("draft")),
             created_at=session.get("created_at"),
             updated_at=session.get("updated_at"),
+            data_source_info=self._data_source_info_out(session.get("data_source")),
         )
 
     def _session_detail_out(self, session: dict) -> SessionDetailOut:

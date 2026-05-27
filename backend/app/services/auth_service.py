@@ -11,12 +11,14 @@ from app.core.security import (
 )
 from app.db.mongo import get_database
 from app.schemas.auth import AuthTokensOut, LoginRequest, RegisterRequest, UserOut
+from app.services.session_service import SessionService
 from app.utils.time import ist_now
 
 
 class AuthService:
     def __init__(self) -> None:
         self.db = get_database()
+        self.session_service = SessionService()
 
     async def register(self, payload: RegisterRequest) -> AuthTokensOut:
         now = ist_now()
@@ -79,6 +81,27 @@ class AuthService:
             raise ValueError("User not found.")
 
         return await self._issue_tokens(user_id, user["email"], user["name"], revoke_hash=refresh_hash)
+
+    async def logout(self, user_id: str, refresh_token: str | None = None) -> None:
+        """
+        Revoke the given refresh token (or all tokens if none given) and
+        disconnect all active data-source sessions for the user.
+        """
+        now = ist_now()
+        if refresh_token:
+            refresh_hash = sha256(refresh_token.encode("utf-8")).hexdigest()
+            await self.db.refresh_tokens.update_one(
+                {"user_id": user_id, "token_hash": refresh_hash, "revoked_at": None},
+                {"$set": {"revoked_at": now}},
+            )
+        else:
+            # Revoke ALL refresh tokens for this user (e.g. logout-all-devices)
+            await self.db.refresh_tokens.update_many(
+                {"user_id": user_id, "revoked_at": None},
+                {"$set": {"revoked_at": now}},
+            )
+        # Disconnect every DB/file session so no live connection credentials remain
+        await self.session_service.disconnect_all_user_sessions(user_id)
 
     async def get_user(self, user: dict) -> UserOut:
         return UserOut(id=str(user["_id"]), email=user["email"], name=user["name"])

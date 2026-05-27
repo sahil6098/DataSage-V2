@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.deps import CurrentUser
-from app.schemas.auth import LoginRequest, RefreshRequest, RegisterRequest
+from app.schemas.auth import LoginRequest, LogoutRequest, RefreshRequest, RegisterRequest
 from app.services.auth_service import AuthService
 from app.utils.api import error_response, ok
 
@@ -35,6 +35,16 @@ async def refresh(payload: RefreshRequest):
     except ValueError as exc:
         return error_response(str(exc), status_code=401)
     return ok(tokens.model_dump(), "Token refreshed.")
+
+
+@router.post("/logout")
+async def logout(payload: LogoutRequest, current_user: CurrentUser):
+    """
+    Revoke the caller's refresh token and disconnect all their active DB sessions.
+    The access token will expire naturally after its TTL.
+    """
+    await service.logout(str(current_user["_id"]), payload.refresh_token)
+    return ok(message="Logged out. All data connections have been closed.")
 
 
 @router.get("/me")
