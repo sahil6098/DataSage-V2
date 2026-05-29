@@ -1631,6 +1631,10 @@ function DataSageChart({
 function Visualization({ vizData, messageContent }: { vizData: string; messageContent?: string }) {
   const [viewMode, setViewMode] = useState<"chart" | "table">("chart");
 
+  useEffect(() => {
+    setViewMode("chart");
+  }, [vizData]);
+
   try {
     const parsed = JSON.parse(vizData) as VizPayload;
     const rows = Array.isArray(parsed.rows) ? parsed.rows.filter(isRecord) : [];

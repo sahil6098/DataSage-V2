@@ -13,6 +13,47 @@ import { toAppPath } from '@/lib/routes';
 
 const API = API_BASE_PATH;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function authErrorText(payload: unknown, fallback: string) {
+  if (!isRecord(payload)) {
+    return fallback;
+  }
+
+  const message = payload.message;
+  if (typeof message === 'string' && message.trim()) {
+    return message;
+  }
+
+  const detail = payload.detail;
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail;
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (!isRecord(item)) return null;
+        const msg = item.msg;
+        const loc = Array.isArray(item.loc) ? item.loc.filter((part) => part !== 'body').join(' ') : '';
+        if (typeof msg !== 'string' || !msg.trim()) return null;
+        return loc ? `${loc}: ${msg}` : msg;
+      })
+      .filter((item): item is string => Boolean(item));
+    if (messages.length) {
+      return messages.join('; ');
+    }
+  }
+
+  return fallback;
+}
+
+function isValidEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
 // ─── Sub-components ────────────────────────────────────────────────────────────
 
 function Particles() {
@@ -337,6 +378,19 @@ export default function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    if (!isValidEmail(email)) {
+      setError('Enter a valid email address.');
+      doShake();
+      return;
+    }
+
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.');
+      doShake();
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -355,8 +409,8 @@ export default function LoginPage() {
       // Send authenticated users to the draft chat workspace and wait for the first message to create a conversation.
       startTransition(() => router.push(toAppPath('/chat', pathname)));
     } catch (err: unknown) {
-      const d = (err as { response?: { data?: { message?: string; detail?: string } } })?.response?.data;
-      setError(d?.message || d?.detail || 'Login failed. Please check your credentials.');
+      const d = (err as { response?: { data?: unknown } })?.response?.data;
+      setError(authErrorText(d, 'Login failed. Please check your credentials.'));
       doShake();
     } finally {
       setLoading(false);

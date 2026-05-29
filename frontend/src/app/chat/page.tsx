@@ -220,7 +220,13 @@ export default function ChatDashboard() {
                             </span>
                             <span className="action-chip-copy">Upload file</span>
                           </button>
-                          <button type="button" className="action-chip cursor-report" onClick={() => console.log('Generate report clicked')}>
+                          <button
+                            type="button"
+                            className="action-chip cursor-report"
+                            onClick={() => console.log('Generate report clicked')}
+                            disabled={true}
+                            title="Send 4 more messages to generate a report"
+                          >
                             <span className="action-chip-glow" />
                             <span className="action-chip-icon">
                               <FileText size={14} />

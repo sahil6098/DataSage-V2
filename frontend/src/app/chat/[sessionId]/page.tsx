@@ -2,7 +2,7 @@
 
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
-import { AlertCircle, BarChart3, Check, ChevronDown, Database, FileSpreadsheet, FileText, Menu, PlugZap, Sparkles, Unplug, Zap, UploadCloud, ArrowUp } from "lucide-react";
+import { AlertCircle, Check, Database, FileSpreadsheet, FileText, Menu, Sparkles, Unplug, UploadCloud, ArrowUp } from "lucide-react";
 import api, { refreshAccessToken } from "@/lib/api";
 import { API_BASE_PATH } from "@/lib/api-base";
 import { getUserDisplayName } from "@/lib/auth-user";
@@ -39,6 +39,15 @@ interface StreamFinalPayload {
 interface SessionResponse {
   messages?: Message[];
   data_source?: ConnectedSourceConfig | null;
+  last_data_source_info?: LastSourceInfo | null;
+}
+
+interface LastSourceInfo {
+  type: string;
+  display_name: string;
+  masked_uri?: string | null;
+  last_used_at?: string | null;
+  last_connected_at?: string | null;
 }
 
 interface Session {
@@ -74,11 +83,6 @@ function isConnectorErrorMessage(message: string | null | undefined) {
   return normalized.includes("no data source connected") || normalized.includes("no active connection");
 }
 
-function formatProviderLabel(provider: LlmProvider) {
-  if (provider === "deepseek") return "DeepSeek";
-  return "Groq";
-}
-
 function formatSourceTitle(sourceConfig: ConnectedSourceConfig | null) {
   return sourceConfig?.file_name || sourceConfig?.database_name || "Connected source";
 }
@@ -105,6 +109,41 @@ function formatSourceSubtitle(sourceConfig: ConnectedSourceConfig | null) {
   return "Source connected";
 }
 
+function sourceConfigFromReconnectPayload(payload: Record<string, unknown> | undefined): ConnectedSourceConfig {
+  return {
+    type: typeof payload?.source_type === "string" ? payload.source_type : undefined,
+    file_name: typeof payload?.file_name === "string" ? payload.file_name : null,
+    database_name: typeof payload?.database_name === "string" ? payload.database_name : null,
+    connection_uri: typeof payload?.connection_uri === "string" ? payload.connection_uri : null,
+  };
+}
+
+function lastSourceInfoFromConfig(sourceConfig: ConnectedSourceConfig | null): LastSourceInfo | null {
+  if (!sourceConfig) {
+    return null;
+  }
+
+  const displayName = sourceConfig.database_name || sourceConfig.file_name || sourceConfig.type || "Previous source";
+  return {
+    type: sourceConfig.type || "",
+    display_name: displayName,
+    masked_uri: sourceConfig.connection_uri || null,
+    last_connected_at: new Date().toISOString(),
+  };
+}
+
+function readApiErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === "object" && error && "response" in error) {
+    const response = (error as { response?: { data?: { message?: unknown; detail?: unknown } } }).response;
+    const message = response?.data?.message || response?.data?.detail;
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+  }
+
+  return error instanceof Error ? error.message : fallback;
+}
+
 export default function ChatSessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const router = useRouter();
@@ -122,13 +161,13 @@ export default function ChatSessionPage() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [sourceConfig, setSourceConfig] = useState<ConnectedSourceConfig | null>(null);
+  const [lastSourceInfo, setLastSourceInfo] = useState<LastSourceInfo | null>(null);
   const [previewRefreshToken, setPreviewRefreshToken] = useState(0);
   const [connectorModalMode, setConnectorModalMode] = useState<"all" | "database" | "file">("all");
   const [llmProvider, setLlmProvider] = useState<LlmProvider>("groq");
   const [disconnecting, setDisconnecting] = useState(false);
+  const [reconnectingSource, setReconnectingSource] = useState(false);
   const [reportLoading, setReportLoading] = useState(false);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const modelMenuRef = useRef<HTMLDivElement>(null);
   const messageBudget = getMessageBudgetState(input);
   const userMessageCount = messages.filter((message) => message.role === "user").length;
   // serverMessageCount = null means session hasn't loaded yet.
@@ -139,12 +178,13 @@ export default function ChatSessionPage() {
     ? Math.max(serverMessageCount, userMessageCount)   // old session: credit existing messages
     : userMessageCount;                                 // new session: count only current messages
   const canGenerateReport = effectiveCount >= MIN_REPORT_USER_MESSAGES;
+  const remainingReportMessages = Math.max(MIN_REPORT_USER_MESSAGES - effectiveCount, 0);
   const reportDisabled = reportLoading || loading || !canGenerateReport;
   const reportTitle = canGenerateReport
     ? "Generate report PDF"
-    : `Send ${MIN_REPORT_USER_MESSAGES - effectiveCount} more message${
-        MIN_REPORT_USER_MESSAGES - effectiveCount === 1 ? "" : "s"
-      } to generate a report`;
+    : `Send ${remainingReportMessages} more message${remainingReportMessages === 1 ? "" : "s"} to generate a report`;
+  const hasPastSessionMessages = (serverMessageCount ?? 0) > 0 || userMessageCount > 0;
+  const showReconnectSource = Boolean(!sourceConfig && lastSourceInfo && hasPastSessionMessages);
 
   const markConnectionInactive = () => {
     setIsConnected(false);
@@ -152,16 +192,6 @@ export default function ChatSessionPage() {
     setSourceConfig(null);
     setPreviewRefreshToken((currentToken) => currentToken + 1);
   };
-
-  useEffect(() => {
-    const savedProvider = typeof window !== "undefined" ? window.localStorage.getItem(MODEL_STORAGE_KEY) : null;
-    if (savedProvider === "groq") {
-      setLlmProvider(savedProvider);
-    } else if (typeof window !== "undefined") {
-      window.localStorage.setItem(MODEL_STORAGE_KEY, "groq");
-      setLlmProvider("groq");
-    }
-  }, []);
 
   useEffect(() => {
     const fetchSessions = async () => {
@@ -176,6 +206,16 @@ export default function ChatSessionPage() {
   }, []);
 
   useEffect(() => {
+    const savedProvider = typeof window !== "undefined" ? window.localStorage.getItem(MODEL_STORAGE_KEY) : null;
+    if (savedProvider === "deepseek" || savedProvider === "groq") {
+      setLlmProvider(savedProvider);
+    } else if (typeof window !== "undefined") {
+      window.localStorage.setItem(MODEL_STORAGE_KEY, "groq");
+      setLlmProvider("groq");
+    }
+  }, []);
+
+  useEffect(() => {
     pendingInitialPromptSentRef.current = false;
     setServerMessageCount(null);
 
@@ -187,6 +227,7 @@ export default function ChatSessionPage() {
         setMessages(loadedMessages);
         setServerMessageCount(loadedMessages.filter((m) => m.role === "user").length);
         const nextSource = session.data_source || null;
+        setLastSourceInfo(session.last_data_source_info || null);
         setSourceConfig(nextSource);
         setIsConnected(false);
 
@@ -548,40 +589,6 @@ export default function ChatSessionPage() {
     }
   }, [sourceConfig]);
 
-  useEffect(() => {
-    if (!modelMenuOpen) {
-      return;
-    }
-
-    const handlePointerDown = (event: MouseEvent) => {
-      if (!modelMenuRef.current?.contains(event.target as Node)) {
-        setModelMenuOpen(false);
-      }
-    };
-
-    const handleEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setModelMenuOpen(false);
-      }
-    };
-
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleEscape);
-
-    return () => {
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleEscape);
-    };
-  }, [modelMenuOpen]);
-
-  const handleProviderChange = (provider: LlmProvider) => {
-    setLlmProvider(provider);
-    setModelMenuOpen(false);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(MODEL_STORAGE_KEY, provider);
-    }
-  };
-
   const handleDisconnectSource = async () => {
     if (!sessionId || disconnecting) {
       return;
@@ -592,12 +599,37 @@ export default function ChatSessionPage() {
       await api.delete(`/connectors/${sessionId}/disconnect`);
       setIsConnected(false);
       setPreviewOpen(false);
+      setLastSourceInfo((current) => current || lastSourceInfoFromConfig(sourceConfig));
       setSourceConfig(null);
       setPreviewRefreshToken((currentToken) => currentToken + 1);
     } catch (error) {
       console.error("Failed to disconnect source", error);
     } finally {
       setDisconnecting(false);
+    }
+  };
+
+  const handleReconnectSource = async () => {
+    if (!sessionId || reconnectingSource) {
+      return;
+    }
+
+    try {
+      setReconnectingSource(true);
+      const response = await api.post(`/connectors/${sessionId}/connect/last`);
+      const nextSource = sourceConfigFromReconnectPayload(response.data.data);
+      setSourceConfig(nextSource);
+      setIsConnected(true);
+      setPreviewRefreshToken((currentToken) => currentToken + 1);
+      setPreviewOpen(true);
+    } catch (error) {
+      const message = readApiErrorMessage(error, "Failed to reconnect the previous source.");
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        { role: "assistant", content: message, status: "complete", stage_label: undefined },
+      ]);
+    } finally {
+      setReconnectingSource(false);
     }
   };
 
@@ -822,63 +854,32 @@ export default function ChatSessionPage() {
                               </span>
                             </button>
                           ) : null}
-                          <div
-                            ref={modelMenuRef}
-                            className={`provider-menu-shell ${modelMenuOpen ? "open" : ""}`}
-                          >
+                          {showReconnectSource ? (
                             <button
                               type="button"
-                              className="provider-chip"
-                              onClick={() => setModelMenuOpen((current) => !current)}
-                              aria-haspopup="menu"
-                              aria-expanded={modelMenuOpen}
-                              disabled={loading}
+                              className="composer-source-chip"
+                              onClick={() => void handleReconnectSource()}
+                              disabled={reconnectingSource || loading}
+                              title={lastSourceInfo?.masked_uri || lastSourceInfo?.display_name || "Reconnect previous source"}
                             >
-                              <span className="provider-chip-glow" />
-                              <span className="provider-chip-icon">
-                                <Zap size={14} />
+                              <span className="composer-source-dot" />
+                              <span className="composer-source-icon">
+                                {lastSourceInfo?.type === "csv" || lastSourceInfo?.type === "excel" ? (
+                                  <FileSpreadsheet size={14} />
+                                ) : (
+                                  <Database size={14} />
+                                )}
                               </span>
-                              <span className="provider-chip-copy">
-                                <span className="provider-chip-label">Model</span>
-                                <span className="provider-chip-value">{formatProviderLabel(llmProvider)}</span>
-                              </span>
-                              <span className={`provider-chip-caret ${modelMenuOpen ? "open" : ""}`}>
-                                <ChevronDown size={16} />
+                              <span className="composer-source-copy">
+                                <span className="composer-source-label">
+                                  {reconnectingSource ? "Reconnecting" : `Previous ${formatLastSourceType(lastSourceInfo)}`}
+                                </span>
+                                <span className="composer-source-value">
+                                  {lastSourceInfo?.display_name || formatLastSourceTime(lastSourceInfo)}
+                                </span>
                               </span>
                             </button>
-
-                            <div className={`provider-menu ${modelMenuOpen ? "open" : ""}`} role="menu" aria-label="Select model">
-                              {(["groq", "deepseek"] as LlmProvider[]).map((provider) => {
-                                const active = provider === llmProvider;
-                                const subtitle = provider === "deepseek"
-                                  ? "DeepSeek via HuggingFace"
-                                  : "Groq key-pool fallback";
-                                return (
-                                  <button
-                                    key={provider}
-                                    type="button"
-                                    role="menuitemradio"
-                                    aria-checked={active}
-                                    className={`provider-option ${active ? "active" : ""}`}
-                                    onClick={() => handleProviderChange(provider)}
-                                  >
-                                    <span className="provider-option-main">
-                                      <span className={`provider-option-icon ${provider}`}>
-                                        <Zap size={13} />
-                                      </span>
-                                      <span className="provider-option-copy">
-                                        <span className="provider-option-title">{formatProviderLabel(provider)}</span>
-                                        <span className="provider-option-subtitle">
-                                          {subtitle}
-                                        </span>
-                                      </span>
-                                    </span>
-                                    {active ? <Check size={16} className="provider-option-check" /> : null}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
+                          ) : null}
                         </div>
 
                         <button
@@ -954,4 +955,27 @@ export default function ChatSessionPage() {
       ) : null}
     </main>
   );
+}
+
+function formatLastSourceType(sourceInfo: LastSourceInfo | null) {
+  const sourceType = (sourceInfo?.type || "").toLowerCase();
+  if (sourceType === "csv") return "CSV file";
+  if (sourceType === "excel") return "Spreadsheet";
+  if (sourceType === "mongodb") return "MongoDB";
+  if (sourceType === "postgresql") return "PostgreSQL";
+  return sourceType ? `${sourceType.toUpperCase()} source` : "Previous source";
+}
+
+function formatLastSourceTime(sourceInfo: LastSourceInfo | null) {
+  const raw = sourceInfo?.last_used_at || sourceInfo?.last_connected_at;
+  if (!raw) return "Last connected";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return "Last connected";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
 }

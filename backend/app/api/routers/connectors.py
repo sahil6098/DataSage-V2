@@ -44,6 +44,15 @@ async def upload_source(session_id: str, current_user: CurrentUser, file: Upload
     return ok(result, "File uploaded.")
 
 
+@router.post("/{session_id}/connect/last")
+async def reconnect_last_source(session_id: str, current_user: CurrentUser):
+    try:
+        result = await service.reconnect_last_source(str(current_user["_id"]), session_id)
+    except ValueError as exc:
+        return error_response(str(exc), status_code=400, error_code="CONNECTOR_ERROR")
+    return ok(result, "Previous source connected.")
+
+
 @router.get("/{session_id}/schema")
 async def get_schema(session_id: str, current_user: CurrentUser):
     try:

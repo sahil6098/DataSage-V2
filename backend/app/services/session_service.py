@@ -79,12 +79,24 @@ class SessionService:
 
     async def update_data_source(self, user_id: str, session_id: str, data_source: dict | None) -> dict:
         session = await self._fetch_owned_session(user_id, session_id)
+        now = ist_now()
+        update_fields = {"data_source": data_source, "updated_at": now}
+        if data_source:
+            data_source.setdefault("last_connected_at", now)
+            data_source["updated_at"] = now
+            update_fields["last_data_source"] = data_source
         await self.db.sessions.update_one(
             {"_id": session["_id"]},
-            {"$set": {"data_source": data_source, "updated_at": ist_now()}},
+            {"$set": update_fields},
         )
         session["data_source"] = data_source
+        if data_source:
+            session["last_data_source"] = data_source
         return session
+
+    async def get_last_data_source(self, user_id: str, session_id: str) -> dict | None:
+        session = await self._fetch_owned_session(user_id, session_id)
+        return session.get("last_data_source")
 
     async def get_data_source(self, user_id: str, session_id: str) -> dict | None:
         session = await self._fetch_owned_session(user_id, session_id)
@@ -106,7 +118,7 @@ class SessionService:
         now = ist_now()
         await self.db.sessions.update_one(
             {"_id": ObjectId(session_id), "user_id": user_id, "data_source": {"$ne": None}},
-            {"$set": {"data_source.last_used_at": now, "updated_at": now}},
+            {"$set": {"data_source.last_used_at": now, "last_data_source.last_used_at": now, "updated_at": now}},
         )
 
     async def _fetch_owned_session(self, user_id: str, session_id: str) -> dict:
@@ -139,6 +151,7 @@ class SessionService:
             display_name=str(display_name),
             masked_uri=source.get("connection_uri_masked"),
             last_used_at=source.get("last_used_at"),
+            last_connected_at=source.get("last_connected_at") or source.get("updated_at") or source.get("created_at"),
         )
 
     def _source_out(self, source: dict | None) -> SourceConfigOut | None:
@@ -163,6 +176,7 @@ class SessionService:
             created_at=session.get("created_at"),
             updated_at=session.get("updated_at"),
             data_source_info=self._data_source_info_out(session.get("data_source")),
+            last_data_source_info=self._data_source_info_out(session.get("last_data_source")),
         )
 
     def _session_detail_out(self, session: dict) -> SessionDetailOut:

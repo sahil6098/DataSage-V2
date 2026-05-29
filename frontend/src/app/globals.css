@@ -31,6 +31,7 @@
 html {
   height: 100%;
   scroll-behavior: smooth;
+  background-color: #111326;
 }
 
 body {
@@ -39,10 +40,7 @@ body {
   color: var(--text-strong);
   font-family: var(--font-body), sans-serif;
   overflow-x: hidden;
-  background:
-    radial-gradient(circle at top left, rgba(120, 173, 255, 0.24), transparent 32%),
-    radial-gradient(circle at top right, rgba(96, 215, 190, 0.16), transparent 24%),
-    linear-gradient(180deg, #f9fbff 0%, #f3f7fd 44%, #eef3fb 100%);
+  background: #111326;
 }
 
 * {
@@ -359,7 +357,7 @@ button {
 .sidebar-panel .brand-row {
   background: transparent !important;
   border-color: transparent !important;
-  border-radius: 0 !important;
+  border-radius: 12px 0 12px 0 !important;
   padding: 8px 12px;
   font-size: 1.35rem;
   letter-spacing: -0.02em;
@@ -693,7 +691,7 @@ button {
   top: 0;
   left: 0;
   padding: 24px 18px;
-  border-radius: 0;
+  border-radius: 0 24px 24px 0;
   border-left: none;
   display: flex;
   flex-direction: column;
@@ -736,7 +734,7 @@ button {
   align-items: center;
   gap: 12px;
   padding: 14px 14px 14px 18px;
-  border-radius: 0;
+  border-radius: 8px;
   border: 1px solid transparent;
   border-left: 3px solid transparent;
   color: var(--text-muted);
@@ -774,20 +772,20 @@ button {
   display: flex;
   align-items: stretch;
   gap: 0;
-  border-radius: 0;
+  border-radius: 16px 0 16px 0 !important;
   overflow: hidden;
 }
 
 .session-item-wrap .session-link {
   flex: 1;
   min-width: 0;
-  border-radius: 0;
+  border-radius: 16px 0 16px 0;
   border-right: none;
 }
 
 .session-item-wrap:has(.session-delete-btn:focus-visible) .session-link,
 .session-item-wrap:hover .session-link {
-  border-radius: 0;
+  border-radius: 16px 0 0 0;
 }
 
 .session-chevron {
@@ -854,7 +852,7 @@ button {
   align-items: center;
   gap: 12px;
   padding: 14px;
-  border-radius: 0;
+  border-radius: 16px 0 16px 0;
   background: rgba(255, 255, 255, 0.68);
   border: 1px solid var(--border-soft);
 }
@@ -868,8 +866,9 @@ button {
 .sidebar-panel .btn-primary,
 .sidebar-panel .btn-secondary,
 .sidebar-panel .info-banner,
-.sidebar-panel .avatar {
-  border-radius: 0 !important;
+.sidebar-panel .avatar,
+.session-item-wrap {
+  border-radius: 16px 0 16px 0 !important;
 }
 
 .avatar {

@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import re
-from difflib import get_close_matches
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -181,6 +180,60 @@ class ConnectorService:
         await self.session_service.update_data_source(user_id, session_id, data_source)
         return {"source_type": source_type, "file_name": original_path.name}
 
+    async def reconnect_last_source(self, user_id: str, session_id: str) -> dict:
+        active_source = await self.session_service.get_data_source(user_id, session_id)
+        if active_source:
+            return self._connected_source_result(active_source)
+
+        last_source = await self.session_service.get_last_data_source(user_id, session_id)
+        if not last_source:
+            raise ValueError("No previous data source is saved for this session.")
+
+        source_type = last_source.get("type")
+        saved_source_id = last_source.get("saved_source_id")
+        if saved_source_id and source_type in {"mongodb", "postgresql"}:
+            return await self.connect_saved_source(user_id, session_id, str(saved_source_id))
+
+        restored_source = copy.deepcopy(last_source)
+        restored_source["last_connected_at"] = ist_now()
+        restored_source["updated_at"] = ist_now()
+
+        if source_type in {"mongodb", "postgresql"}:
+            encrypted_uri = restored_source.get("connection_uri_encrypted")
+            if not encrypted_uri:
+                raise ValueError("The previous database source cannot be reconnected.")
+            parsed = ParsedConnection(
+                source_type=source_type,
+                normalized_uri=decrypt_text(encrypted_uri),
+                masked_uri=restored_source.get("connection_uri_masked") or "",
+                database_name=restored_source.get("database_name") or "",
+                host="",
+                display_name=restored_source.get("database_name") or "source",
+            )
+            schema = await self._build_live_schema(parsed, restored_source)
+            restored_source["database_name"] = schema.get("database_name") or parsed.database_name
+            restored_source["schema_cache"] = schema
+            restored_source["selected_tables"] = restored_source.get("selected_tables") or [
+                table["name"] for table in schema.get("tables", [])
+            ]
+        else:
+            file_path = Path(str(restored_source.get("file_path") or ""))
+            if not file_path.exists():
+                raise ValueError("The previous uploaded file is no longer available. Please upload it again.")
+            if not restored_source.get("schema_cache"):
+                schema = await self._build_file_schema(
+                    file_path,
+                    restored_source,
+                    display_file_name=restored_source.get("file_name"),
+                )
+                restored_source["schema_cache"] = schema
+                restored_source["selected_tables"] = restored_source.get("selected_tables") or [
+                    table["name"] for table in schema.get("tables", [])
+                ]
+
+        await self.session_service.update_data_source(user_id, session_id, restored_source)
+        return self._connected_source_result(restored_source)
+
     async def get_schema(self, user_id: str, session_id: str) -> SchemaResponse:
         data_source = await self.session_service.get_data_source(user_id, session_id)
         if not data_source:
@@ -268,6 +321,15 @@ class ConnectorService:
 
     async def disconnect(self, user_id: str, session_id: str) -> None:
         await self.session_service.update_data_source(user_id, session_id, None)
+
+    def _connected_source_result(self, data_source: dict) -> dict:
+        return {
+            "source_type": data_source.get("type"),
+            "database_name": data_source.get("database_name"),
+            "file_name": data_source.get("file_name"),
+            "connection_uri": data_source.get("connection_uri_masked"),
+            "saved_source_id": data_source.get("saved_source_id"),
+        }
 
     async def _upsert_saved_source(self, user_id: str, parsed: ParsedConnection) -> str:
         fingerprint = sha256(f"{parsed.source_type}:{parsed.normalized_uri}".encode("utf-8")).hexdigest()
@@ -384,23 +446,11 @@ class ConnectorService:
                         for name in client.list_database_names()
                         if name not in {"admin", "config", "local"}
                     ]
-                    suggested = get_close_matches(database_name, available_databases, n=1, cutoff=0.82)
-                    if suggested:
-                        database_name_to_use = suggested[0]
-                        logger.info(
-                            "Using close MongoDB database name match '%s' for requested '%s'.",
-                            database_name_to_use,
-                            database_name,
-                        )
-                        database = client[database_name_to_use]
-                        collection_names = database.list_collection_names()
-                    else:
-                        database_name_to_use = database_name
                 else:
-                    database_name_to_use = database_name
+                    available_databases = []
 
                 if not collection_names:
-                    available_text = ", ".join(available_databases[:10]) if "available_databases" in locals() else ""
+                    available_text = ", ".join(available_databases[:10])
                     hint = f" Available databases: {available_text}." if available_text else ""
                     raise ValueError(f"MongoDB database '{database_name}' has no collections or was not found.{hint}")
 
@@ -421,7 +471,7 @@ class ConnectorService:
                     )
                 return {
                     "source_type": "mongodb",
-                    "database_name": database_name_to_use,
+                    "database_name": database_name,
                     "database_description": None,
                     "selected_table_count": len(tables),
                     "tables": tables,

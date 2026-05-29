@@ -1445,14 +1445,36 @@ class ChatService:
             {"role": "user", "content": question, "created_at": now},
             {"role": "assistant", "content": message, "viz_data": viz_data, "created_at": now},
         )
-        await self.memory_service.remember_turn(
+        asyncio.create_task(self._remember_turn_safe(
             user_id=user_id,
             session_id=session_id,
             question=question,
             answer=message,
             tables_used=tables_used,
             intent_type=intent_type,
-        )
+        ))
+
+    async def _remember_turn_safe(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        question: str,
+        answer: str,
+        tables_used: list[str] | None,
+        intent_type: str | None,
+    ) -> None:
+        try:
+            await self.memory_service.remember_turn(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                tables_used=tables_used,
+                intent_type=intent_type,
+            )
+        except Exception as exc:
+            logger.warning("Background memory persistence failed: %s", exc)
 
     async def _stream_prebuilt_reply(
         self,
@@ -2139,7 +2161,11 @@ class ChatService:
             and self._user_requested_visualization(state["question"])
             and self._rows_are_chartable(rows)
         )
-        payload.setdefault("chart_type", "bar")
+        payload["chart_type"] = self._resolve_visual_chart_type(
+            question=state["question"],
+            rows=rows,
+            preferred_chart_type=payload.get("chart_type"),
+        ) if payload["needs_visualization"] else None
         payload.setdefault("summary", "Query result")
         if provider:
             return {"answer_payload": payload, "provider_used": provider}
@@ -2262,6 +2288,44 @@ class ChatService:
             )
         return base
 
+    def _parse_chart_number(self, value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            return numeric if numeric == numeric and numeric not in {float("inf"), float("-inf")} else None
+        if not isinstance(value, str):
+            return None
+
+        text = value.strip().lower()
+        if not text:
+            return None
+
+        multiplier = 1.0
+        suffix_multipliers = (
+            ("crore", 10_000_000.0),
+            ("cr", 10_000_000.0),
+            ("lakh", 100_000.0),
+            ("lac", 100_000.0),
+            ("k", 1_000.0),
+            ("m", 1_000_000.0),
+            ("b", 1_000_000_000.0),
+            ("t", 1_000_000_000_000.0),
+        )
+        for suffix, value_multiplier in suffix_multipliers:
+            if text.endswith(suffix):
+                multiplier = value_multiplier
+                text = text[: -len(suffix)].strip()
+                break
+
+        text = re.sub(r"[$₹€£,%\s,]", "", text)
+        if not text:
+            return None
+        try:
+            return float(text) * multiplier
+        except ValueError:
+            return None
+
     def _rows_are_chartable(self, rows: list[dict]) -> bool:
         """
         A result is chartable when it has 2+ rows and at least one column
@@ -2275,16 +2339,33 @@ class ChatService:
         numeric_keys: set[str] = set()
         for row in rows:
             for key, value in row.items():
-                if isinstance(value, (int, float)):
+                if self._parse_chart_number(value) is not None:
                     numeric_keys.add(key)
-                elif isinstance(value, str):
-                    # Accept strings that are purely numeric (Decimal/coerced)
-                    stripped = value.strip().lstrip("-+")
-                    if stripped and stripped.replace(".", "", 1).isdigit():
-                        numeric_keys.add(key)
         # Need at least one numeric column; relax the 2-row minimum for
         # explicit single-result charts (e.g. "show total revenue as a gauge")
         return bool(numeric_keys)
+
+    def _resolve_visual_chart_type(
+        self,
+        *,
+        question: str,
+        rows: list[dict],
+        preferred_chart_type: str | None,
+    ) -> str:
+        preferred = (preferred_chart_type or "").strip().lower()
+        if preferred in {"3d_bar", "bar", "horizontal_bar", "line", "donut", "radar"}:
+            return preferred
+
+        normalized = question.lower()
+        if re.search(r"\b3d\b|\bthree[- ]d\b|\bthree dimensional\b", normalized):
+            return "3d_bar"
+        if re.search(r"\b(line|trend|growth|change|history)\b", normalized) or "over time" in normalized:
+            return "line"
+        if re.search(r"\b(pie|donut|doughnut|share|proportion|percentage|breakdown)\b", normalized):
+            return "donut"
+        if re.search(r"\b(compare|comparison|vs|versus|rank|top|bottom)\b", normalized) or len(rows) > 8:
+            return "horizontal_bar"
+        return "bar"
 
     def _answer_prompt(self) -> str:
         return (
@@ -2333,14 +2414,10 @@ class ChatService:
         for row in rows:
             new_row: dict = {}
             for key, value in row.items():
-                if isinstance(value, str):
-                    stripped = value.strip().lstrip("-+")
-                    if stripped and stripped.replace(".", "", 1).isdigit():
-                        try:
-                            new_row[key] = float(value.strip())
-                            continue
-                        except (ValueError, OverflowError):
-                            pass
+                numeric_value = self._parse_chart_number(value)
+                if numeric_value is not None:
+                    new_row[key] = numeric_value
+                    continue
                 new_row[key] = value
             coerced.append(new_row)
         return coerced
@@ -2370,7 +2447,11 @@ class ChatService:
 
         viz_payload = {
             "rows": chart_rows,
-            "chart_type": query_plan.get("chart_type") or "bar",
+            "chart_type": self._resolve_visual_chart_type(
+                question=question,
+                rows=chart_rows,
+                preferred_chart_type=query_plan.get("chart_type"),
+            ),
             "explanation": answer,
             "query": query_preview,
             "query_type": query_plan.get("query_type"),

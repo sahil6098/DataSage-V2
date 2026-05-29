@@ -167,6 +167,9 @@ class SessionMemoryService:
             session_id=session_id,
             limit=RECENT_TURN_LIMIT,
         )
+        if not recent_turns:
+            return ""
+
         semantic_matches = await self._recall_semantic(
             user_id=user_id,
             session_id=session_id,
