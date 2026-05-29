@@ -17,6 +17,7 @@ import DataSourcePreview, { type ConnectedSourceConfig } from "@/components/Data
 
 const API = API_BASE_PATH;
 const MODEL_STORAGE_KEY = "llm_provider";
+const PENDING_PROMPT_STORAGE_PREFIX = "datasage_pending_prompt:";
 const STREAM_FRAME_MS = 16;
 const MIN_REPORT_USER_MESSAGES = 4;
 
@@ -111,6 +112,7 @@ export default function ChatSessionPage() {
   const searchParams = useSearchParams();
   const currentUser = useCurrentUser();
   const endOfMessagesRef = useRef<HTMLDivElement>(null);
+  const pendingInitialPromptSentRef = useRef(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -174,6 +176,9 @@ export default function ChatSessionPage() {
   }, []);
 
   useEffect(() => {
+    pendingInitialPromptSentRef.current = false;
+    setServerMessageCount(null);
+
     const fetchSession = async () => {
       try {
         const response = await api.get(`/sessions/${sessionId}`);
@@ -506,12 +511,28 @@ export default function ChatSessionPage() {
   };
 
   useEffect(() => {
-    const initialPrompt = searchParams.get("prompt");
-    if (initialPrompt && isConnected && messages.length === 0) {
-      window.history.replaceState({}, document.title, window.location.pathname);
-      void sendMessage(initialPrompt);
+    if (pendingInitialPromptSentRef.current || serverMessageCount === null || messages.length !== 0 || loading) {
+      return;
     }
-  }, [isConnected, messages.length, searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const legacyPrompt = searchParams.get("prompt");
+    const storageKey = `${PENDING_PROMPT_STORAGE_PREFIX}${sessionId}`;
+    const storedPrompt = typeof window !== "undefined" ? window.sessionStorage.getItem(storageKey) : null;
+    const initialPrompt = storedPrompt || legacyPrompt;
+
+    if (!initialPrompt) {
+      return;
+    }
+
+    pendingInitialPromptSentRef.current = true;
+    if (typeof window !== "undefined") {
+      window.sessionStorage.removeItem(storageKey);
+    }
+    if (legacyPrompt) {
+      router.replace(toAppPath(`/chat/${sessionId}`, pathname));
+    }
+    void sendMessage(initialPrompt);
+  }, [serverMessageCount, messages.length, loading, searchParams, sessionId, router, pathname]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (searchParams.get("connector") === "1") {

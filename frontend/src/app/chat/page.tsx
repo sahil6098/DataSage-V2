@@ -21,6 +21,8 @@ import { summarizeSessionTitle } from "@/lib/session-titles";
 import AnimatedBackground from "@/components/AnimatedBackground";
 import Sidebar from "@/components/Sidebar";
 
+const PENDING_PROMPT_STORAGE_PREFIX = "datasage_pending_prompt:";
+
 interface Session {
   id?: string;
   _id?: string;
@@ -61,9 +63,12 @@ export default function ChatDashboard() {
           ? { draft: true, title: summarizeSessionTitle(prompt) }
           : { draft: true },
       );
+      if (prompt && typeof window !== "undefined") {
+        window.sessionStorage.setItem(`${PENDING_PROMPT_STORAGE_PREFIX}${sessionId}`, prompt);
+      }
 
       startTransition(() => {
-        router.push(toAppPath(`/chat/${sessionId}${prompt ? `?prompt=${encodeURIComponent(prompt)}` : ""}`, pathname));
+        router.push(toAppPath(`/chat/${sessionId}`, pathname));
       });
     } catch (error) {
       console.error("Failed to create session", error);

@@ -90,6 +90,11 @@ class MongoAnalysisPlan(BaseModel):
         return normalize_chart_type(v) if isinstance(v, str) else v
 
 
+class ChatIntent(BaseModel):
+    intent: Literal["analysis", "source_overview", "conversation"]
+    reason: str | None = None
+
+
 class AnalysisAnswerPayload(BaseModel):
     answer: str = Field(min_length=1)
     needs_visualization: bool = False
