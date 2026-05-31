@@ -1,8 +1,10 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { Database, Sparkles, UploadCloud, X } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Database, FileSpreadsheet, Sparkles, UploadCloud, X } from "lucide-react";
 import api from "@/lib/api";
+import { toAppPath } from "@/lib/routes";
 import { validateSourceConnectionUri } from "@/lib/source-validation";
 
 interface ConnectorModalProps {
@@ -18,7 +20,7 @@ interface ConnectorModalProps {
   }) => void;
 }
 
-type TabId = "mongodb" | "postgresql" | "file";
+type TabId = "mongodb" | "postgresql" | "file" | "googlesheet";
 
 interface SavedSource {
   id: string;
@@ -29,11 +31,11 @@ interface SavedSource {
   updated_at?: string | null;
 }
 
-function isDatabaseTab(tab: TabId): tab is Exclude<TabId, "file"> {
-  return tab !== "file";
+function isDatabaseTab(tab: TabId): tab is "mongodb" | "postgresql" {
+  return tab === "mongodb" || tab === "postgresql";
 }
 
-function getSavedConnectionTab(connectionType: string | undefined, fallbackTab: TabId): Exclude<TabId, "file"> {
+function getSavedConnectionTab(connectionType: string | undefined, fallbackTab: TabId): "mongodb" | "postgresql" {
   if (connectionType === "mongodb" || connectionType === "postgresql") {
     return connectionType;
   }
@@ -49,12 +51,20 @@ function getDbPlaceholder(activeTab: TabId) {
 }
 
 function readErrorMessage(err: unknown, fallback: string) {
+  const response = (
+    typeof err === "object" &&
+    err &&
+    "response" in err
+      ? (err as { response?: { data?: { message?: string; detail?: string }; status?: number } }).response
+      : undefined
+  );
+  // Redirect if the session itself is gone so the user gets a fresh session.
+  if (response?.status === 404 || response?.data?.message?.toLowerCase().includes("session not found")) {
+    return "SESSION_NOT_FOUND";
+  }
   return (
-    (typeof err === "object" &&
-      err &&
-      "response" in err &&
-      typeof (err as { response?: { data?: { message?: string } } }).response?.data?.message === "string" &&
-      (err as { response?: { data?: { message?: string } } }).response?.data?.message) ||
+    (response?.data?.message && typeof response.data.message === "string" && response.data.message) ||
+    (response?.data?.detail && typeof response.data.detail === "string" && response.data.detail) ||
     fallback
   );
 }
@@ -66,10 +76,12 @@ export default function ConnectorModal({
   onClose,
   onConnect,
 }: ConnectorModalProps) {
+  const router = useRouter();
   const [activeTab, setActiveTab] = useState<TabId>(initialTab);
   const [uri, setUri] = useState("");
   const [dbName, setDbName] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [sheetUrl, setSheetUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedConnections, setSavedConnections] = useState<SavedSource[]>([]);
@@ -94,7 +106,7 @@ export default function ConnectorModal({
     void fetchSavedConnections();
   }, []);
 
-  const connectDatabase = async (selectedTab: Exclude<TabId, "file">, connectionUri: string, databaseNameValue = "") => {
+  const connectDatabase = async (selectedTab: "mongodb" | "postgresql", connectionUri: string, databaseNameValue = "") => {
     if (!sessionId) {
       setError("Create or open a chat session before connecting a source.");
       return;
@@ -137,7 +149,13 @@ export default function ConnectorModal({
       });
       onClose();
     } catch (err: unknown) {
-      setError(readErrorMessage(err, "Failed to connect to the selected source."));
+      const msg = readErrorMessage(err, "Failed to connect to the selected source.");
+      if (msg === "SESSION_NOT_FOUND") {
+        onClose();
+        router.replace(toAppPath("/chat", window.location.pathname));
+        return;
+      }
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -168,7 +186,49 @@ export default function ConnectorModal({
       });
       onClose();
     } catch (err: unknown) {
-      setError(readErrorMessage(err, "Failed to connect to the saved source."));
+      const msg = readErrorMessage(err, "Failed to connect to the saved source.");
+      if (msg === "SESSION_NOT_FOUND") {
+        onClose();
+        router.replace(toAppPath("/chat", window.location.pathname));
+        return;
+      }
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleConnectGoogleSheet = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!sessionId) {
+      setError("Create or open a chat session before connecting a source.");
+      return;
+    }
+    if (!sheetUrl.trim()) {
+      setError("Google Sheet URL is required.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const response = await api.post(`/connectors/${sessionId}/google-sheet`, {
+        sheet_url: sheetUrl.trim(),
+      });
+      onConnect({
+        type: response.data.data?.source_type || "googlesheet",
+        file_name: response.data.data?.file_name || "Google Sheet",
+      });
+      onClose();
+    } catch (err: unknown) {
+      const msg = readErrorMessage(err, "Failed to connect to Google Sheet.");
+      if (msg === "SESSION_NOT_FOUND") {
+        onClose();
+        router.replace(toAppPath("/chat", window.location.pathname));
+        return;
+      }
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -200,7 +260,13 @@ export default function ConnectorModal({
       });
       onClose();
     } catch (err: unknown) {
-      setError(readErrorMessage(err, "Failed to upload file."));
+      const msg = readErrorMessage(err, "Failed to upload file.");
+      if (msg === "SESSION_NOT_FOUND") {
+        onClose();
+        router.replace(toAppPath("/chat", window.location.pathname));
+        return;
+      }
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -208,15 +274,16 @@ export default function ConnectorModal({
 
   const tabs: { id: TabId; label: string; icon: React.ReactNode }[] = [
     { id: "file", label: "Files", icon: <UploadCloud size={16} /> },
+    { id: "googlesheet", label: "Google Sheets", icon: <FileSpreadsheet size={16} /> },
     { id: "mongodb", label: "MongoDB", icon: <Database size={16} /> },
     { id: "postgresql", label: "PostgreSQL", icon: <Database size={16} /> },
   ];
 
   let tabsToRender = tabs;
   if (mode === "database") {
-    tabsToRender = tabs.filter((tab) => tab.id !== "file");
+    tabsToRender = tabs.filter((tab) => tab.id !== "file" && tab.id !== "googlesheet");
   } else if (mode === "file") {
-    tabsToRender = tabs.filter((tab) => tab.id === "file");
+    tabsToRender = tabs.filter((tab) => tab.id === "file" || tab.id === "googlesheet");
   }
 
   return (
@@ -285,6 +352,30 @@ export default function ConnectorModal({
               <p className="helper-text">Best for quick testing, lightweight dashboards, and ad hoc chat analysis.</p>
               <button type="submit" className="btn-primary" disabled={loading || !file}>
                 {loading ? "Uploading..." : "Upload and connect"}
+              </button>
+            </div>
+          </form>
+        ) : activeTab === "googlesheet" ? (
+          <form key="googlesheet-form" className="field-stack" onSubmit={handleConnectGoogleSheet}>
+            <div className="info-banner connector-security-note">
+              <Sparkles size={18} />
+              Ensure the Google Sheet is shared with "Anyone with the link can view". Private or restricted sheets will fail to import.
+            </div>
+            <div className="field">
+              <label htmlFor="googlesheet-url">Google Sheet URL</label>
+              <input
+                id="googlesheet-url"
+                type="text"
+                placeholder="https://docs.google.com/spreadsheets/d/.../edit"
+                value={sheetUrl}
+                onChange={(event) => setSheetUrl(event.target.value)}
+                required
+              />
+            </div>
+            <div className="composer-footer">
+              <p className="helper-text">Queries a public sheet dynamically, analyzing its columns just like a CSV dataset.</p>
+              <button type="submit" className="btn-primary" disabled={loading || !sheetUrl.trim()}>
+                {loading ? "Connecting..." : "Connect sheet"}
               </button>
             </div>
           </form>

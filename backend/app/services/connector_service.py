@@ -5,6 +5,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 import duckdb
 from bson import ObjectId
 from pymongo import MongoClient
@@ -29,6 +31,7 @@ from app.utils.serialization import normalize_value
 from app.utils.tabular import dataframe_preview_fields, dataframe_rows, detect_source_type, load_tabular_source
 from app.utils.time import ist_now, to_ist_iso
 from app.utils.uri_validation import ConnectionValidationError, ParsedConnection, validate_connection_uri
+from app.services.quality_service import QualityService
 
 
 logger = get_logger(__name__)
@@ -39,6 +42,7 @@ class ConnectorService:
         self.db = get_database()
         self.session_service = SessionService()
         self.settings = get_settings()
+        self.quality_service = QualityService()
 
     async def list_saved_sources(self, user_id: str) -> list[SavedSourceOut]:
         cursor = self.db.saved_sources.find({"user_id": user_id}).sort("updated_at", -1)
@@ -174,11 +178,82 @@ class ConnectorService:
             "field_descriptions": {},
             "schema_cache": schema,
             "saved_source_id": None,
+            "quality_report": {},
             "created_at": ist_now(),
             "updated_at": ist_now(),
         }
+        # Compute dataset quality report (best-effort, non-blocking on failure)
+        try:
+            data_source["quality_report"] = await self._compute_file_quality_async(
+                target_path, schema
+            )
+        except Exception as exc:
+            logger.warning("Quality report failed for %s: %s", original_path.name, exc)
+
         await self.session_service.update_data_source(user_id, session_id, data_source)
-        return {"source_type": source_type, "file_name": original_path.name}
+        return {
+            "source_type": source_type,
+            "file_name": original_path.name,
+            "quality_report": data_source.get("quality_report", {}),
+        }
+
+    async def import_google_sheet(self, user_id: str, session_id: str, sheet_url: str) -> dict:
+        """Download a public Google Sheet as CSV and process it identically to a file upload."""
+        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", sheet_url)
+        if not match:
+            raise ValueError(
+                "Invalid Google Sheets URL. Copy the full URL from your browser address bar."
+            )
+        sheet_id = match.group(1)
+        gid_match = re.search(r"gid=(\d+)", sheet_url)
+        gid = gid_match.group(1) if gid_match else "0"
+        export_url = (
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
+            f"?format=csv&gid={gid}"
+        )
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            try:
+                response = await client.get(export_url)
+                if response.status_code in {400, 401, 403}:
+                    raise ValueError(
+                        "The Google Sheet is not publicly accessible. "
+                        "Open the sheet in Google Sheets, click Share → General access → "
+                        "'Anyone with the link' → Viewer, then try again."
+                    )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise ValueError(
+                    f"Failed to download Google Sheet (HTTP {exc.response.status_code}). "
+                    "Ensure the sheet is shared publicly and the URL is copied from your browser address bar."
+                ) from exc
+            except httpx.RequestError as exc:
+                raise ValueError(f"Network error downloading Google Sheet: {exc}") from exc
+        file_name = f"google_sheet_{sheet_id[:12]}.csv"
+        return await self.upload_file(user_id, session_id, file_name, response.content)
+
+    async def _compute_file_quality_async(self, file_path: Path, schema: dict) -> dict:
+        """Load sample rows from each table and compute quality reports."""
+        reports: dict = {}
+        for table in schema.get("tables", [])[:3]:
+            table_name = str(table.get("name") or "")
+            if not table_name:
+                continue
+            try:
+                rows = await self._fetch_file_rows(file_path, table_name, 500, None)
+                if rows:
+                    reports[table_name] = self.quality_service.compute_quality_report(
+                        rows, table_name
+                    )
+            except Exception as exc:
+                logger.warning("Quality check failed for table %s: %s", table_name, exc)
+        return reports
+
+    async def get_quality_report(self, user_id: str, session_id: str) -> dict:
+        """Return the quality report stored in the active session data source."""
+        data_source = await self.session_service.get_data_source(user_id, session_id)
+        if not data_source:
+            raise ValueError("No data source connected to this session.")
+        return data_source.get("quality_report") or {}
 
     async def reconnect_last_source(self, user_id: str, session_id: str) -> dict:
         active_source = await self.session_service.get_data_source(user_id, session_id)

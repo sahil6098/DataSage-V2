@@ -1,3 +1,5 @@
+from pydantic import BaseModel
+
 from fastapi import APIRouter, File, Query, UploadFile
 
 from app.api.deps import CurrentUser
@@ -8,6 +10,10 @@ from app.utils.api import error_response, ok
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 service = ConnectorService()
+
+
+class GoogleSheetRequest(BaseModel):
+    sheet_url: str
 
 
 @router.get("/library")
@@ -21,7 +27,10 @@ async def connect_source(session_id: str, payload: ConnectDatabaseRequest, curre
     try:
         result = await service.connect_database(str(current_user["_id"]), session_id, payload)
     except ValueError as exc:
-        return error_response(str(exc), status_code=400, error_code="CONNECTOR_ERROR")
+        msg = str(exc)
+        if "session not found" in msg.lower():
+            return error_response(msg, status_code=404, error_code="SESSION_NOT_FOUND")
+        return error_response(msg, status_code=400, error_code="CONNECTOR_ERROR")
     return ok(result, "Source connected.")
 
 
@@ -30,7 +39,10 @@ async def connect_saved_source(session_id: str, saved_source_id: str, current_us
     try:
         result = await service.connect_saved_source(str(current_user["_id"]), session_id, saved_source_id)
     except ValueError as exc:
-        return error_response(str(exc), status_code=400, error_code="CONNECTOR_ERROR")
+        msg = str(exc)
+        if "session not found" in msg.lower():
+            return error_response(msg, status_code=404, error_code="SESSION_NOT_FOUND")
+        return error_response(msg, status_code=400, error_code="CONNECTOR_ERROR")
     return ok(result, "Saved source connected.")
 
 
@@ -40,7 +52,10 @@ async def upload_source(session_id: str, current_user: CurrentUser, file: Upload
         file_bytes = await file.read()
         result = await service.upload_file(str(current_user["_id"]), session_id, file.filename or "upload.csv", file_bytes)
     except ValueError as exc:
-        return error_response(str(exc), status_code=400, error_code="CONNECTOR_ERROR")
+        msg = str(exc)
+        if "session not found" in msg.lower():
+            return error_response(msg, status_code=404, error_code="SESSION_NOT_FOUND")
+        return error_response(msg, status_code=400, error_code="CONNECTOR_ERROR")
     return ok(result, "File uploaded.")
 
 
@@ -93,3 +108,25 @@ async def update_schema_context(
 async def disconnect_source(session_id: str, current_user: CurrentUser):
     await service.disconnect(str(current_user["_id"]), session_id)
     return ok(message="Source disconnected.")
+
+
+@router.post("/{session_id}/google-sheet")
+async def import_google_sheet(session_id: str, payload: GoogleSheetRequest, current_user: CurrentUser):
+    """Download a public Google Sheet and connect it as a CSV data source."""
+    try:
+        result = await service.import_google_sheet(
+            str(current_user["_id"]), session_id, payload.sheet_url
+        )
+    except ValueError as exc:
+        return error_response(str(exc), status_code=400, error_code="CONNECTOR_ERROR")
+    return ok(result, "Google Sheet connected.")
+
+
+@router.get("/{session_id}/quality")
+async def get_quality_report(session_id: str, current_user: CurrentUser):
+    """Return the dataset quality report for the active file data source."""
+    try:
+        report = await service.get_quality_report(str(current_user["_id"]), session_id)
+    except ValueError as exc:
+        return error_response(str(exc), status_code=400, error_code="NO_CONNECTION")
+    return ok(report)

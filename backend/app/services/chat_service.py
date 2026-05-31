@@ -10,7 +10,10 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app.schemas.chat import AnalysisAnswerPayload, ChatIntent, MongoAnalysisPlan, SqlAnalysisPlan
+from app.services.anomaly_service import AnomalyService
 from app.services.connector_service import ConnectorService
+from app.services.forecast_service import ForecastService
+from app.services.history_service import HistoryService
 from app.services.llm_service import LlmService
 from app.services.memory_service import SessionMemoryService
 from app.services.session_service import SessionService
@@ -132,6 +135,9 @@ class ChatService:
         self.llm_service = LlmService()
         self.memory_service = SessionMemoryService()
         self.query_cache = QueryPlanCache()
+        self.anomaly_service = AnomalyService()
+        self.forecast_service = ForecastService()
+        self.history_service = HistoryService()
         self.graph = self._build_graph()
 
     async def process_message_stream(
@@ -384,6 +390,23 @@ class ChatService:
                     yield event
                 return
 
+        # --- Anomaly Detection (local, zero LLM cost) ---
+        anomaly_result = self.anomaly_service.detect_anomalies(rows)
+
+        # --- Time-series detection + forecasting (only if explicitly requested by question intent) ---
+        ts_data = self.forecast_service.extract_time_series(rows)
+        forecast_result: dict | None = None
+        wants_forecast = any(k in question.lower() for k in ("forecast", "predict", "future", "next", "projection", "estimate"))
+        if ts_data and wants_forecast:
+            try:
+                forecast_result = await asyncio.to_thread(
+                    self.forecast_service.forecast_series, ts_data["values"]
+                )
+                if forecast_result and not forecast_result.get("can_forecast"):
+                    forecast_result = None
+            except Exception as exc:
+                logger.warning("Forecast computation failed: %s", exc)
+
         yield self._stage_event("generating", "Generating insight")
 
         answer_chunks: list[str] = []
@@ -395,6 +418,7 @@ class ChatService:
                 query_plan=state["query_plan"],
                 rows=rows,
                 sanity_warnings=sanity_warnings,
+                anomaly_summary=anomaly_result.get("summary") if anomaly_result.get("has_anomalies") else None,
             ),
             preferred_provider=state.get("provider_used") or state.get("provider_preference"),
             max_output_tokens=500,
@@ -415,6 +439,9 @@ class ChatService:
             answer=message,
         )
 
+        # --- Generate follow-up suggestions (rule-based, zero LLM cost) ---
+        follow_ups = self._generate_follow_ups(question, rows, state["query_plan"])
+
         # --- Tier 4: Cache successful plan ---
         if not cached_plan and rows and not self._has_blocking_sanity_warning(sanity_warnings):
             plan_to_cache = {**state["query_plan"], "_cached_provider": state.get("provider_used")}
@@ -426,7 +453,6 @@ class ChatService:
         if _plan.get("collection"):
             _tables_used = [str(_plan["collection"])]
         elif _plan.get("query"):
-            # Extract FROM/JOIN table names from SQL
             _tables_used = self._extract_sql_tables(_plan["query"], state["data_source"])
 
         await self._append_turn(
@@ -438,11 +464,34 @@ class ChatService:
             tables_used=_tables_used or None,
             intent_type="analytical",
         )
-        # Stamp last_used_at on the data source so the sessions list
-        # shows when this connection was most recently queried.
+        # Save to query history (fire-and-forget, non-blocking)
+        asyncio.ensure_future(
+            self._save_history_safe(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                answer_preview=message,
+            )
+        )
+        # Stamp last_used_at on the data source
         asyncio.ensure_future(
             self.session_service.touch_data_source_last_used(user_id, session_id)
         )
+
+        # Build forecast payload
+        _forecast_payload: dict | None = None
+        if ts_data and forecast_result and forecast_result.get("can_forecast"):
+            _forecast_payload = {
+                "ts_labels": ts_data["labels"],
+                "ts_values": ts_data["values"],
+                "value_key": ts_data["value_key"],
+                "label_key": ts_data["label_key"],
+                "forecast": forecast_result["forecast"],
+                "lower_ci": forecast_result["lower_ci"],
+                "upper_ci": forecast_result["upper_ci"],
+                "method": forecast_result["method"],
+                "summary": forecast_result["summary"],
+            }
 
         yield {
             "type": "final",
@@ -450,6 +499,9 @@ class ChatService:
                 "message": message,
                 "viz_data": viz_data,
                 "provider_used": state.get("provider_used"),
+                "follow_ups": follow_ups,
+                "anomaly_data": anomaly_result if anomaly_result.get("has_anomalies") else None,
+                "forecast_data": _forecast_payload,
             },
         }
 
@@ -2547,7 +2599,10 @@ class ChatService:
             "If the data has both an ID field and a name field, always use the name in your answer. "
             "If the result set is small (1-3 rows), give a direct factual answer. "
             "If the result set is large (10+ rows), summarize the key patterns and top items. "
-            "Do not mention JSON, SQL, MongoDB, pipelines, prompts, or any technical implementation details."
+            "Do not mention JSON, SQL, MongoDB, pipelines, prompts, or any technical implementation details. "
+            "IMPORTANT: Do NOT describe or explain how a chart, graph, bar chart, or any visualization would look, appear, or be drawn. "
+            "Do NOT say things like 'the graph would show', 'the chart would display', 'a bar would represent', or 'to visualize this'. "
+            "Only explain the data findings and insights directly — the visualization is handled separately."
         )
 
     def _answer_user_prompt(
@@ -2558,6 +2613,7 @@ class ChatService:
         query_plan: dict,
         rows: list[dict],
         sanity_warnings: list[str] | None = None,
+        anomaly_summary: str | None = None,
     ) -> str:
         limited_rows = self._compact_prompt_rows(rows)
         prompt = (
@@ -2565,6 +2621,8 @@ class ChatService:
             f"Executed query plan:\n{self._json_for_prompt(query_plan)}\n\n"
             f"Rows:\n{self._json_for_prompt(limited_rows)}"
         )
+        if anomaly_summary:
+            prompt += f"\n\nAnomaly context:\n{anomaly_summary}"
         if sanity_warnings:
             prompt += (
                 "\n\nResult quality warnings:\n"
@@ -3477,4 +3535,191 @@ class ChatService:
         parts = [hint]
         parts.append("Try asking with a specific table, field, metric, company, or time period from the connected schema.")
         return "\n\n".join(parts)
+    def _generate_follow_ups(self, question: str, rows: list[dict], query_plan: dict) -> list[str]:
+        """Generate 3 context-aware follow-up suggestions based on question intent and result shape."""
+        if not rows:
+            return []
 
+        cols = list(rows[0].keys())
+        q = question.lower()
+
+        # ── Classify column types ────────────────────────────────────────────
+        numeric_cols = [
+            c for c in cols
+            if any(
+                isinstance(row.get(c), (int, float)) and not isinstance(row.get(c), bool)
+                for row in rows[:5]
+            )
+        ]
+        time_cols = [
+            c for c in cols
+            if any(k in c.lower() for k in ("date", "month", "year", "week", "period", "time", "quarter", "day"))
+        ]
+        id_like = {"id", "_id", "uuid", "guid", "key", "code", "index", "unnamed: 0"}
+        cat_cols = [
+            c for c in cols
+            if c not in numeric_cols and c not in time_cols and c.lower() not in id_like
+        ]
+
+        # ── Pick the most descriptive column per type ────────────────────────
+        METRIC_SIGNALS  = ("revenue", "sales", "amount", "total", "profit", "value", "price", "cost", "income", "spend", "count")
+        CATEGORY_SIGNALS = ("category", "segment", "region", "product", "name", "type", "status", "group", "department", "city", "country")
+
+        def _best(col_list: list[str], signals: tuple) -> str | None:
+            for sig in signals:
+                for c in col_list:
+                    if sig in c.lower():
+                        return c
+            return col_list[0] if col_list else None
+
+        metric   = _best(numeric_cols, METRIC_SIGNALS)
+        category = _best(cat_cols,     CATEGORY_SIGNALS)
+        time_col = time_cols[0] if time_cols else None
+
+        # ── Detect question intent ───────────────────────────────────────────
+        is_top_n        = any(k in q for k in ("top", "highest", "most", "best", "largest", "biggest", "leading", "maximum", "max"))
+        is_bottom       = any(k in q for k in ("bottom", "lowest", "worst", "least", "smallest", "minimum", "min"))
+        is_trend        = any(k in q for k in ("trend", "over time", "monthly", "weekly", "daily", "yearly", "growth", "change", "evolution"))
+        is_compare      = any(k in q for k in ("compare", "vs", "versus", "difference", "between", "against", "relative"))
+        is_count        = any(k in q for k in ("count", "how many", "number of", "total number", "records", "rows"))
+        is_average      = any(k in q for k in ("average", "avg", "mean", "median", "per"))
+        is_sum          = any(k in q for k in ("total", "sum", "aggregate", "combined", "overall"))
+        is_filter       = any(k in q for k in ("where", "filter", "only", "specific", "with status", "for category"))
+        is_anomaly      = any(k in q for k in ("anomaly", "anomalies", "outlier", "unusual", "spike", "weird", "irregular"))
+        is_forecast     = any(k in q for k in ("forecast", "predict", "future", "next", "projection", "estimate"))
+        is_distribution = any(k in q for k in ("distribution", "spread", "range", "histogram", "breakdown"))
+        is_ranking      = any(k in q for k in ("rank", "ranking", "order", "sorted", "ordered"))
+
+        suggestions: list[str] = []
+        seen: set[str] = set()
+
+        def add(s: str) -> None:
+            key = s.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                suggestions.append(s.strip())
+
+        # ── Intent-specific suggestions ──────────────────────────────────────
+        if is_top_n and metric:
+            add(f"Show the bottom 10 by {metric}")
+            if time_col:
+                add(f"How has {metric} trended over {time_col}?")
+            if category:
+                add(f"What is the average {metric} per {category}?")
+
+        elif is_bottom and metric:
+            add(f"Show the top 10 by {metric}")
+            if category:
+                add(f"Which {category} consistently underperforms?")
+            if time_col:
+                add(f"Has {metric} improved over {time_col}?")
+
+        elif is_trend and metric:
+            add(f"Forecast the next 3 periods for {metric}")
+            if category:
+                add(f"Which {category} is growing fastest?")
+            add(f"Are there any anomalies in {metric}?")
+
+        elif is_forecast and metric:
+            if time_col:
+                add(f"Show the full historical trend of {metric} over {time_col}")
+            if category:
+                add(f"Which {category} has the most stable {metric}?")
+            add(f"Are there any anomalies in {metric}?")
+
+        elif is_compare and metric:
+            add(f"Rank all groups by total {metric}")
+            if time_col:
+                add(f"Show {metric} comparison over {time_col}")
+            if category:
+                add(f"What percentage share does each {category} hold?")
+
+        elif is_sum and metric:
+            if category:
+                add(f"What percentage does each {category} contribute to total {metric}?")
+            if time_col:
+                add(f"Show {metric} totals over {time_col}")
+            add(f"Which rows have the highest {metric}?")
+
+        elif is_average and metric:
+            add(f"Show total {metric} grouped by {category}" if category else f"Show total {metric}")
+            add(f"Which rows are significantly above average {metric}?")
+            if time_col:
+                add(f"How has the average {metric} changed over {time_col}?")
+
+        elif is_count:
+            if metric and category:
+                add(f"What is the total {metric} per {category}?")
+            elif category:
+                add(f"Which {category} appears most frequently?")
+            if time_col:
+                add(f"Show record count trend over {time_col}")
+            if metric:
+                add(f"Show the distribution of {metric}")
+
+        elif is_filter and metric:
+            if category:
+                add(f"Show {metric} for all {category} groups, unfiltered")
+            if time_col:
+                add(f"How does this filter compare over {time_col}?")
+            add(f"What is the average {metric} for filtered rows?")
+
+        elif is_anomaly:
+            if metric:
+                add(f"Show the trend of {metric} to see the spike in context")
+            if category:
+                add(f"Which {category} contributes most to the anomalies?")
+            add("Filter the results to show only the anomalous rows")
+
+        elif is_distribution and metric:
+            add(f"What is the average {metric}?")
+            add(f"Find outliers in {metric}")
+            if category:
+                add(f"Compare {metric} distribution across {category}")
+
+        elif is_ranking and metric:
+            if category:
+                add(f"Show the bottom 10 {category} by {metric}")
+            if time_col:
+                add(f"Has the {metric} ranking changed over {time_col}?")
+            add(f"What is the average {metric} across all groups?")
+
+        # ── Generic fallbacks (fire only if still short) ─────────────────────
+        if len(suggestions) < 3 and metric and category:
+            add(f"Break down {metric} by {category}")
+        if len(suggestions) < 3 and metric and time_col:
+            add(f"Show {metric} trend over {time_col}")
+        if len(suggestions) < 3 and metric and time_col and not is_forecast:
+            add(f"Forecast the next 3 periods for {metric}")
+        if len(suggestions) < 3 and metric and len(rows) > 5:
+            add(f"Find anomalies in {metric}")
+        if len(suggestions) < 3 and metric:
+            add(f"What is the average {metric}?")
+        if len(suggestions) < 3 and category:
+            add(f"Show unique values and counts for {category}")
+        if len(suggestions) < 3 and numeric_cols:
+            second_metric = next((c for c in numeric_cols if c != metric), None)
+            if second_metric:
+                add(f"Compare {metric} and {second_metric} side by side")
+
+        return suggestions[:3]
+
+
+    async def _save_history_safe(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        question: str,
+        answer_preview: str,
+    ) -> None:
+        """Fire-and-forget wrapper around HistoryService.save_query."""
+        try:
+            await self.history_service.save_query(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                answer_preview=answer_preview,
+            )
+        except Exception as exc:
+            logger.warning("Query history save failed: %s", exc)

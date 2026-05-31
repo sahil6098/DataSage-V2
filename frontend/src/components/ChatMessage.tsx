@@ -13,12 +13,42 @@ import {
   type TooltipItem,
 } from "chart.js";
 
+interface AnomalyItem {
+  row_index: number;
+  field: string;
+  value: number;
+  zscore: number;
+  method: string;
+}
+
+interface AnomalyData {
+  anomalies: AnomalyItem[];
+  anomaly_indices: number[];
+  summary: string;
+  has_anomalies: boolean;
+}
+
+interface ForecastData {
+  ts_labels: string[];
+  ts_values: number[];
+  value_key: string;
+  label_key: string;
+  forecast: number[];
+  lower_ci: number[];
+  upper_ci: number[];
+  method: string;
+  summary: string;
+}
+
 interface Message {
   role: string;
   content: string;
   viz_data?: string;
   status?: "streaming" | "complete";
   stage_label?: string;
+  follow_ups?: string[];
+  anomaly_data?: AnomalyData | null;
+  forecast_data?: ForecastData | null;
 }
 
 function getNameInitials(name: string) {
@@ -907,6 +937,29 @@ function normalizeRecordRows(rows: Array<Record<string, unknown>>): NormalizedCh
   const labelKey = findLabelKey(keys, rows);
   const numericKeys = keys.filter((key) => key !== labelKey && rows.some((row) => toChartNumber(row[key]) !== null));
   const valueKeys = numericKeys;
+
+  // When there is no label column (all columns are numeric), pivot the data:
+  // use humanized column names as X-axis labels so bars are named instead of "Item 1"
+  if (!labelKey && numericKeys.length >= 2 && rows.length <= 3) {
+    const pivotedLabels = numericKeys.map(humanizeFieldName);
+    const pivotedData = rows.map((_, rowIndex) =>
+      numericKeys.map((key) => toChartNumber(rows[rowIndex][key]) ?? Number.NaN)
+    );
+    return {
+      labels: pivotedLabels,
+      datasets:
+        rows.length === 1
+          ? [{ label: "Value", data: pivotedData[0] }]
+          : rows.map((_, rowIndex) => ({ label: `Row ${rowIndex + 1}`, data: pivotedData[rowIndex] })),
+      columnNames: numericKeys,
+      numericColumnNames: numericKeys,
+      rowCount: pivotedLabels.length,
+      sourceRows: rows,
+      labelColumn: undefined,
+      sameEntityNumericDimensions: numericKeys.length >= 3,
+    };
+  }
+
   const labels = labelKey ? rows.map((row, index) => toLabel(row[labelKey], index)) : rows.map((_, index) => `Item ${index + 1}`);
 
   if (!valueKeys.length) return emptyNormalizedChartData();
@@ -930,6 +983,27 @@ function normalizeSqlRows(columns: unknown[], rows: unknown[][]): NormalizedChar
     .map((_, index) => index)
     .filter((index) => index !== labelIndex && rows.some((row) => toChartNumber(row[index]) !== null));
   const valueIndexes = numericIndexes;
+
+  // When there is no label column (all columns are numeric), pivot the data:
+  // use humanized column names as X-axis labels so bars are named instead of "Item 1"
+  if (labelIndex < 0 && numericIndexes.length >= 2 && rows.length <= 3) {
+    const pivotedLabels = numericIndexes.map((index) => humanizeFieldName(columnNames[index]));
+    const pivotedData = rows.map((row) =>
+      numericIndexes.map((index) => toChartNumber(row[index]) ?? Number.NaN)
+    );
+    return {
+      labels: pivotedLabels,
+      datasets:
+        rows.length === 1
+          ? [{ label: "Value", data: pivotedData[0] }]
+          : rows.map((_, rowIndex) => ({ label: `Row ${rowIndex + 1}`, data: pivotedData[rowIndex] })),
+      columnNames: numericIndexes.map((index) => columnNames[index]),
+      numericColumnNames: numericIndexes.map((index) => columnNames[index]),
+      rowCount: pivotedLabels.length,
+      sameEntityNumericDimensions: numericIndexes.length >= 3,
+    };
+  }
+
   const labels =
     labelIndex >= 0 ? rows.map((row, index) => toLabel(row[labelIndex], index)) : rows.map((_, index) => `Item ${index + 1}`);
 
@@ -1513,21 +1587,7 @@ function renderTable(rows: Array<Record<string, unknown>>, title = "Data preview
 }
 
 function QueryExplanation({ query }: { query?: string }) {
-  const [open, setOpen] = useState(false);
-  if (!query) return null;
-
-  return (
-    <div className="query-explanation-wrap">
-      <details className="query-code-details" open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
-        <summary className="query-code-summary">
-          <Code2 size={13} />
-          {open ? "Hide query" : "View generated query"}
-          <ChevronRight size={13} className={`query-caret ${open ? "open" : ""}`} />
-        </summary>
-        <pre className="query-code-block"><code>{query}</code></pre>
-      </details>
-    </div>
-  );
+  return null;
 }
 
 function DataSageChart({
@@ -1741,7 +1801,15 @@ const MemoizedVisualization = React.memo(
 
 /* ─── ChatMessage ─── */
 
-function ChatMessage({ message, userDisplayName }: { message: Message; userDisplayName?: string }) {
+function ChatMessage({
+  message,
+  userDisplayName,
+  onFollowUpClick,
+}: {
+  message: Message;
+  userDisplayName?: string;
+  onFollowUpClick?: (text: string) => void;
+}) {
   const isUser = message.role === "user";
   const isStreaming = !isUser && message.status === "streaming";
   const showStreamLoader = isStreaming && !message.content.trim();
@@ -1788,6 +1856,61 @@ function ChatMessage({ message, userDisplayName }: { message: Message; userDispl
         <div className="message-content">{renderMessageContent(message.content)}</div>
       )}
       {message.viz_data ? <MemoizedVisualization vizData={message.viz_data} messageContent={message.content} /> : null}
+
+      {/* ── Anomaly Alert ── */}
+      {!message.role.startsWith("u") && message.anomaly_data?.has_anomalies ? (
+        <div className="anomaly-alert">
+          <span className="anomaly-alert-icon">⚠</span>
+          <div>
+            <strong>Anomaly Detected</strong>
+            <p style={{ margin: "4px 0 6px" }}>{message.anomaly_data.summary}</p>
+            <div className="anomaly-list">
+              {message.anomaly_data.anomalies.slice(0, 4).map((a, i) => (
+                <span key={i} className="anomaly-pill">
+                  {a.field}: <strong>{typeof a.value === "number" ? a.value.toLocaleString() : a.value}</strong>
+                  {a.zscore > 0 ? ` (z=${a.zscore})` : ""}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── Forecast Summary ── */}
+      {!message.role.startsWith("u") && message.forecast_data?.forecast?.length ? (
+        <div className="forecast-card">
+          <div className="forecast-header">
+            <span className="forecast-badge">🔮 Forecast</span>
+            <span className="forecast-method">{message.forecast_data.method}</span>
+          </div>
+          <p className="forecast-summary">{message.forecast_data.summary}</p>
+          <div className="forecast-values">
+            {message.forecast_data.forecast.slice(0, 5).map((v, i) => (
+              <span key={i} className="forecast-value-chip">
+                {message.forecast_data!.ts_labels.length > 0
+                  ? `+${i + 1}`
+                  : `Period ${i + 1}`}: <strong>{typeof v === "number" ? v.toLocaleString(undefined, { maximumFractionDigits: 2 }) : v}</strong>
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── Follow-up Chips ── */}
+      {!message.role.startsWith("u") && message.status === "complete" && message.follow_ups && message.follow_ups.length > 0 ? (
+        <div className="follow-up-chips">
+          {message.follow_ups.map((suggestion, i) => (
+            <button
+              key={i}
+              type="button"
+              className="follow-up-chip"
+              onClick={() => onFollowUpClick?.(suggestion)}
+            >
+              {suggestion}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -1799,5 +1922,6 @@ export default React.memo(
     prev.message.content === next.message.content &&
     prev.message.viz_data === next.message.viz_data &&
     prev.message.status === next.message.status &&
-    prev.userDisplayName === next.userDisplayName,
+    prev.userDisplayName === next.userDisplayName &&
+    prev.onFollowUpClick === next.onFollowUpClick,
 );

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from app.api.routers.auth import router as auth_router
 from app.api.routers.chat import router as chat_router
 from app.api.routers.connectors import router as connectors_router
+from app.api.routers.history import router as history_router
 from app.api.routers.sessions import router as sessions_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -81,3 +82,4 @@ app.include_router(auth_router)
 app.include_router(sessions_router)
 app.include_router(connectors_router)
 app.include_router(chat_router)
+app.include_router(history_router)

@@ -1,8 +1,9 @@
 "use client";
 
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ChevronRight, LogOut, MessageSquarePlus, Sparkles, Trash2, X } from "lucide-react";
+import { ChevronRight, Clock, LogOut, MessageSquarePlus, Sparkles, Star, Trash2, X } from "lucide-react";
 import { BrandLogoIcon } from "@/components/BrandLogo";
 import api from "@/lib/api";
 import { clearStoredAuthUser, getUserDisplayName, getUserInitials, type AuthUser } from "@/lib/auth-user";
@@ -14,6 +15,13 @@ interface Session {
   _id?: string;
   name?: string;
   title?: string;
+}
+
+interface HistoryItem {
+  id: string;
+  session_id: string;
+  question: string;
+  is_favorite: boolean;
 }
 
 interface SidebarProps {
@@ -30,20 +38,30 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
   const userDisplayName = getUserDisplayName(currentUser);
   const userSubtitle =
     currentUser?.name?.trim() && currentUser?.email?.trim() ? currentUser.email.trim() : "Authenticated session";
+
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+
   const normalizedSessions = sessions
     .map((session, index) => {
       const sessionId = session.id || session._id;
-      if (!sessionId) {
-        return null;
-      }
-
-      return {
-        sessionId,
-        title: session.name || session.title || `Analysis ${index + 1}`,
-        index,
-      };
+      if (!sessionId) return null;
+      return { sessionId, title: session.name || session.title || `Analysis ${index + 1}`, index };
     })
-    .filter((session): session is { sessionId: string; title: string; index: number } => Boolean(session));
+    .filter((s): s is { sessionId: string; title: string; index: number } => Boolean(s));
+
+  const fetchHistory = useCallback(async () => {
+    try {
+      const res = await api.get("/history");
+      setHistory(res.data.data || []);
+    } catch {
+      // silently ignore if history fetch fails
+    }
+  }, []);
+
+  useEffect(() => {
+    if (showHistory) void fetchHistory();
+  }, [showHistory, fetchHistory]);
 
   const logout = () => {
     localStorage.removeItem("access_token");
@@ -54,7 +72,6 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
 
   const handleNewChat = async () => {
     try {
-      // Open a fresh hidden draft session so the user lands in a real blank chat before the first message is sent.
       const sessionId = await createSession({ draft: true });
       router.push(toAppPath(`/chat/${sessionId}`, pathname));
       onClose?.();
@@ -69,42 +86,53 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
     try {
       await api.delete(`/sessions/${sessionId}`);
       onSessionDeleted?.(sessionId);
-      // Navigate away if the deleted session is currently active
       const deletedPath = toAppPath(`/chat/${sessionId}`, pathname);
-      if (pathname === deletedPath) {
-        router.push(toAppPath("/chat", pathname));
-      }
+      if (pathname === deletedPath) router.push(toAppPath("/chat", pathname));
     } catch (error) {
       console.error("Failed to delete session", error);
     }
   };
 
+  const handleToggleFavorite = async (item: HistoryItem, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await api.post(`/history/${item.id}/favorite`);
+      setHistory((prev) => prev.map((h) => (h.id === item.id ? { ...h, is_favorite: !h.is_favorite } : h)));
+    } catch { /* ignore */ }
+  };
+
+  const handleDeleteHistory = async (item: HistoryItem, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await api.delete(`/history/${item.id}`);
+      setHistory((prev) => prev.filter((h) => h.id !== item.id));
+    } catch { /* ignore */ }
+  };
+
+  const handleReuseQuery = async (item: HistoryItem) => {
+    try {
+      const sessionId = item.session_id || (await createSession({ draft: true }));
+      router.push(toAppPath(`/chat/${sessionId}`, pathname));
+      onClose?.();
+    } catch { /* ignore */ }
+  };
+
+  const favorites = history.filter((h) => h.is_favorite);
+  const recent = history.filter((h) => !h.is_favorite).slice(0, 10);
+
   return (
     <aside className={`sidebar-panel ${isOpen ? "open" : ""}`}>
       <div className="sidebar-top">
         <Link href={toAppPath("/chat", pathname)} className="brand-row">
-          <span className="brand-mark">
-            <BrandLogoIcon size={18} />
-          </span>
+          <span className="brand-mark"><BrandLogoIcon size={18} /></span>
           DataSage
         </Link>
-        <button
-          type="button"
-          className="btn-ghost mobile-sidebar-toggle"
-          onClick={onClose}
-          aria-label="Close sidebar"
-        >
+        <button type="button" className="btn-ghost mobile-sidebar-toggle" onClick={onClose} aria-label="Close sidebar">
           <X size={18} />
         </button>
       </div>
 
-      <button
-        type="button"
-        className="btn-primary"
-        onClick={() => {
-          void handleNewChat();
-        }}
-      >
+      <button type="button" className="btn-primary" onClick={() => void handleNewChat()}>
         <MessageSquarePlus size={18} />
         New analysis
       </button>
@@ -118,20 +146,14 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
         <div className="sidebar-section-title">Recent chats</div>
         <div className="session-list">
           {normalizedSessions.length === 0 ? (
-            <div className="empty-copy" style={{ padding: "14px 8px" }}>
-              Your new sessions will appear here.
-            </div>
+            <div className="empty-copy" style={{ padding: "14px 8px" }}>Your new sessions will appear here.</div>
           ) : (
             normalizedSessions.map((session) => {
               const sessionPath = toAppPath(`/chat/${session.sessionId}`, pathname);
               const active = pathname === sessionPath;
               return (
                 <div key={session.sessionId} className="session-item-wrap">
-                  <Link
-                    href={sessionPath}
-                    className={`session-link ${active ? "active" : ""}`}
-                    onClick={() => onClose?.()}
-                  >
+                  <Link href={sessionPath} className={`session-link ${active ? "active" : ""}`} onClick={() => onClose?.()}>
                     <span className="avatar" style={{ width: 38, height: 38, borderRadius: "50%" }}>
                       {String(session.index + 1).padStart(2, "0")}
                     </span>
@@ -141,12 +163,8 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
                     </div>
                     <ChevronRight size={16} className="session-chevron" />
                   </Link>
-                  <button
-                    type="button"
-                    className="session-delete-btn"
-                    aria-label="Delete session"
-                    onClick={(e) => void handleDeleteSession(session.sessionId, e)}
-                  >
+                  <button type="button" className="session-delete-btn" aria-label="Delete session"
+                    onClick={(e) => void handleDeleteSession(session.sessionId, e)}>
                     <Trash2 size={14} />
                   </button>
                 </div>
@@ -154,6 +172,68 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
             })
           )}
         </div>
+
+        {/* ── Query History ── */}
+        <button type="button" className="sidebar-section-title sidebar-history-toggle"
+          onClick={() => setShowHistory((v) => !v)}
+          style={{ width: "100%", textAlign: "left", cursor: "pointer", background: "none", border: "none", padding: 0 }}>
+          <Clock size={13} style={{ marginRight: 6, verticalAlign: "middle" }} />
+          Query history {showHistory ? "▲" : "▼"}
+        </button>
+
+        {showHistory && (
+          <div className="query-history-section">
+            {favorites.length > 0 && (
+              <>
+                <div className="query-history-group-label">⭐ Favorites</div>
+                {favorites.map((item) => (
+                  <div key={item.id} className="query-history-item" onClick={() => void handleReuseQuery(item)}>
+                    <span className="query-history-text" title={item.question}>
+                      {item.question.length > 60 ? item.question.slice(0, 60) + "…" : item.question}
+                    </span>
+                    <span className="query-history-actions">
+                      <button type="button" className="query-history-fav active"
+                        onClick={(e) => void handleToggleFavorite(item, e)} title="Unfavorite">
+                        <Star size={12} fill="currentColor" />
+                      </button>
+                      <button type="button" className="query-history-del"
+                        onClick={(e) => void handleDeleteHistory(item, e)} title="Delete">
+                        <Trash2 size={12} />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+            {recent.length > 0 && (
+              <>
+                <div className="query-history-group-label">Recent</div>
+                {recent.map((item) => (
+                  <div key={item.id} className="query-history-item" onClick={() => void handleReuseQuery(item)}>
+                    <span className="query-history-text" title={item.question}>
+                      {item.question.length > 60 ? item.question.slice(0, 60) + "…" : item.question}
+                    </span>
+                    <span className="query-history-actions">
+                      <button type="button" className="query-history-fav"
+                        onClick={(e) => void handleToggleFavorite(item, e)} title="Favorite">
+                        <Star size={12} />
+                      </button>
+                      <button type="button" className="query-history-del"
+                        onClick={(e) => void handleDeleteHistory(item, e)} title="Delete">
+                        <Trash2 size={12} />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+            {favorites.length === 0 && recent.length === 0 && (
+              <div className="empty-copy" style={{ padding: "10px 8px", fontSize: 13 }}>
+                Your analyzed questions will appear here.
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="sidebar-footer">
@@ -164,7 +244,6 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
             <span className="message-time">{currentUser ? userSubtitle : "Authenticated session"}</span>
           </div>
         </div>
-
         <button type="button" className="btn-secondary btn-logout" onClick={logout}>
           <LogOut size={18} />
           Logout

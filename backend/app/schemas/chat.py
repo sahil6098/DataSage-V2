@@ -102,6 +102,7 @@ class AnalysisAnswerPayload(BaseModel):
     chart_title: str | None = None
     summary: str | None = None
     query_preview: str | None = None
+    follow_ups: list[str] = []
 
     @field_validator("chart_type", mode="before")
     @classmethod

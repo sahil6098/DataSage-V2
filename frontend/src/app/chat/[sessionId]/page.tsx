@@ -23,17 +23,50 @@ const MIN_REPORT_USER_MESSAGES = 4;
 
 type LlmProvider = "groq" | "deepseek";
 
+interface AnomalyItem {
+  row_index: number;
+  field: string;
+  value: number;
+  zscore: number;
+  method: string;
+}
+
+interface AnomalyData {
+  anomalies: AnomalyItem[];
+  anomaly_indices: number[];
+  summary: string;
+  has_anomalies: boolean;
+}
+
+interface ForecastData {
+  ts_labels: string[];
+  ts_values: number[];
+  value_key: string;
+  label_key: string;
+  forecast: number[];
+  lower_ci: number[];
+  upper_ci: number[];
+  method: string;
+  summary: string;
+}
+
 interface Message {
   role: string;
   content: string;
   viz_data?: string;
   status?: "streaming" | "complete";
   stage_label?: string;
+  follow_ups?: string[];
+  anomaly_data?: AnomalyData | null;
+  forecast_data?: ForecastData | null;
 }
 
 interface StreamFinalPayload {
   message?: string;
   viz_data?: string;
+  follow_ups?: string[];
+  anomaly_data?: AnomalyData | null;
+  forecast_data?: ForecastData | null;
 }
 
 interface SessionResponse {
@@ -239,15 +272,27 @@ export default function ChatSessionPage() {
             markConnectionInactive();
           }
         }
-      } catch (error) {
-        console.error(error);
+      } catch (error: unknown) {
+        // If the session no longer exists (404) or cannot be accessed, redirect to /chat
+        // to avoid broken state and the cascade "Session not found" errors on uploads.
+        const status =
+          typeof error === "object" &&
+          error &&
+          "response" in error
+            ? (error as { response?: { status?: number } }).response?.status
+            : undefined;
+        if (status === 404 || status === 403) {
+          router.replace(toAppPath("/chat", pathname));
+          return;
+        }
+        console.error("Failed to load session:", error);
       }
     };
 
     if (sessionId) {
-      fetchSession();
+      void fetchSession();
     }
-  }, [sessionId]);
+  }, [sessionId, router, pathname]);
 
   useEffect(() => {
     endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -517,6 +562,11 @@ export default function ChatSessionPage() {
           role: "assistant",
           content: finalMessage || current.content,
           viz_data: finalPayload?.viz_data,
+          follow_ups: Array.isArray(finalPayload?.follow_ups) && finalPayload.follow_ups.length
+            ? finalPayload.follow_ups
+            : undefined,
+          anomaly_data: finalPayload?.anomaly_data ?? undefined,
+          forecast_data: finalPayload?.forecast_data ?? undefined,
           status: "complete",
           stage_label: undefined,
         }));
@@ -769,6 +819,7 @@ export default function ChatSessionPage() {
                           key={`${message.role}-${index}`}
                           message={message}
                           userDisplayName={getUserDisplayName(currentUser)}
+                          onFollowUpClick={(text) => { void sendMessage(text); }}
                         />
                       ))}
                     </div>

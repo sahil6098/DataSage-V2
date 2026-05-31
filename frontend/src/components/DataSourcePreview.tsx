@@ -6,6 +6,7 @@ import {
   Database,
   FileSpreadsheet,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 import {
   Bar,
@@ -538,6 +539,16 @@ export default function DataSourcePreview({
   });
   const [schemaContextStatus, setSchemaContextStatus] = useState<{ tone: "success" | "error"; message: string } | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
+  const [qualityReport, setQualityReport] = useState<Record<string, {
+    quality_score: number;
+    quality_label: string;
+    duplicate_rows: number;
+    duplicate_pct: number;
+    avg_missing_pct: number;
+    outlier_columns: string[];
+    missing_by_column: Record<string, { count: number; pct: number }>;
+  }> | null>(null);
+  const [loadingQuality, setLoadingQuality] = useState(false);
 
   useEffect(() => {
     if (!isOpen) {
@@ -584,6 +595,19 @@ export default function DataSourcePreview({
           return nextTables[0]?.name || "";
         });
         onConnectionStateChange?.(true);
+
+        // Fetch Quality Report in parallel
+        try {
+          const qRes = await api.get(`/connectors/${sessionId}/quality`);
+          if (qRes.data?.data) {
+            setQualityReport(qRes.data.data);
+          } else {
+            setQualityReport(null);
+          }
+        } catch (qErr) {
+          console.error("Quality report fetch failed:", qErr);
+          setQualityReport(null);
+        }
       } catch (fetchError: unknown) {
         if (cancelled) {
           return;
@@ -1057,6 +1081,79 @@ export default function DataSourcePreview({
                   <small>{hasChart ? "Auto-picked from the preview" : "No chartable pattern detected yet"}</small>
                 </article>
               </div>
+ 
+              {/* ── Data Quality Assessment Card ── */}
+              {qualityReport && selectedTable && qualityReport[selectedTable] ? (() => {
+                const report = qualityReport[selectedTable];
+                return (
+                  <section className="schema-context-card" style={{ marginTop: 20 }}>
+                    <div className="schema-context-header" style={{ borderBottom: "1px solid rgba(255,255,255,0.06)", paddingBottom: 12 }}>
+                      <div>
+                        <h4 style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <Sparkles size={16} style={{ color: "#818cf8" }} />
+                          Data Quality Assessment
+                        </h4>
+                        <p style={{ margin: "4px 0 0" }}>Analysis sample stats to identify gaps, duplicates, or missing metrics.</p>
+                      </div>
+                      <span className={`status-pill ${report.quality_score >= 85 ? "success" : report.quality_score >= 65 ? "info" : "warning"}`} style={{ fontSize: 13, background: "rgba(99,102,241,0.12)", border: "1px solid rgba(99,102,241,0.3)", color: "#a5b4fc" }}>
+                        Score: {report.quality_score}/100 ({report.quality_label})
+                      </span>
+                    </div>
+
+                    <div className="preview-summary-grid" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", marginTop: 14, gap: 12 }}>
+                      <article className="preview-summary-card" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)" }}>
+                        <span>Avg Missing</span>
+                        <strong style={{ fontSize: 18 }}>{report.avg_missing_pct}%</strong>
+                        <small>Null/empty values</small>
+                      </article>
+                      <article className="preview-summary-card" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)" }}>
+                        <span>Duplicate rows</span>
+                        <strong style={{ fontSize: 18 }}>{numberFormatter.format(report.duplicate_rows)}</strong>
+                        <small>{report.duplicate_pct}% of sample</small>
+                      </article>
+                      <article className="preview-summary-card" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)" }}>
+                        <span>Outliers</span>
+                        <strong style={{ fontSize: 18 }}>{report.outlier_columns?.length || 0}</strong>
+                        <small>{report.outlier_columns?.length ? "Columns flagged" : "No columns flagged"}</small>
+                      </article>
+                    </div>
+
+                    {report.outlier_columns?.length ? (
+                      <div style={{ marginTop: 14 }}>
+                        <span className="schema-context-label" style={{ fontSize: 11, textTransform: "uppercase" }}>Outlier Fields</span>
+                        <div className="schema-table-chip-grid" style={{ marginTop: 6 }}>
+                          {report.outlier_columns.map(col => (
+                            <span key={col} className="schema-table-chip" style={{ cursor: "default", borderColor: "rgba(239, 68, 68, 0.2)", background: "rgba(239, 68, 68, 0.04)" }}>
+                              {col}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {report.missing_by_column && Object.keys(report.missing_by_column).length ? (
+                      <div style={{ marginTop: 16 }}>
+                        <span className="schema-context-label" style={{ fontSize: 11, textTransform: "uppercase" }}>Null counts by column</span>
+                        <div className="schema-field-editor-list" style={{ marginTop: 8, maxHeight: 180, overflowY: "auto", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: 8 }}>
+                          {Object.entries(report.missing_by_column)
+                            .filter(([_, stats]) => stats.count > 0)
+                            .map(([col, stats]) => (
+                              <div key={col} style={{ display: "flex", justifyContent: "space-between", padding: "6px 8px", borderBottom: "1px solid rgba(255,255,255,0.04)", fontSize: 13 }}>
+                                <span style={{ color: "#a5b4fc" }}>{col}</span>
+                                <span style={{ color: "#e5e7eb" }}>
+                                  <strong>{numberFormatter.format(stats.count)}</strong> nulls ({stats.pct}%)
+                                </span>
+                              </div>
+                            ))}
+                          {!Object.values(report.missing_by_column).some(s => s.count > 0) ? (
+                            <p className="helper-text" style={{ margin: 0, textAlign: "center", padding: "8px 0" }}>No missing values detected in any columns! 🎉</p>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
+                  </section>
+                );
+              })() : null}
 
               <section className="schema-context-card">
                 <div className="schema-context-header">
