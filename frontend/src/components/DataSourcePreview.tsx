@@ -770,13 +770,6 @@ export default function DataSourcePreview({
     }
 
     const selectedTables = schemaContextDraft.selectedTables.filter(Boolean);
-    if (!selectedTables.length) {
-      setSchemaContextStatus({
-        tone: "error",
-        message: "Select at least one table for the bot context before saving.",
-      });
-      return;
-    }
 
     setSavingContext(true);
     setSchemaContextStatus(null);
@@ -796,7 +789,9 @@ export default function DataSourcePreview({
       setSchemaContextDraft(buildSchemaContextDraft(nextSchema));
       setSchemaContextStatus({
         tone: "success",
-        message: "Bot guidance saved. Future answers will use the selected tables and descriptions.",
+        message: selectedTables.length
+          ? "Bot guidance saved. Future answers will use the selected tables and descriptions."
+          : "Bot guidance saved. No tables are selected, so data questions will wait for a table selection.",
       });
       setSelectedTable((currentTable) => {
         if (currentTable && nextTables.some((table) => table.name === currentTable)) {

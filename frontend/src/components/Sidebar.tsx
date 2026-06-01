@@ -109,7 +109,6 @@ export default function Sidebar({ sessions, currentUser = null, isOpen = true, o
                     </span>
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <strong>{session.title}</strong>
-                      <span>{session.sessionId.slice(0, 8)}</span>
                     </div>
                     <ChevronRight size={16} className="session-chevron" />
                   </Link>

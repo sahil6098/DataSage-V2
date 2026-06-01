@@ -375,9 +375,10 @@ class ConnectorService:
             schema = await self._build_live_schema(parsed, restored_source)
             restored_source["database_name"] = schema.get("database_name") or parsed.database_name
             restored_source["schema_cache"] = schema
-            restored_source["selected_tables"] = restored_source.get("selected_tables") or [
-                table["name"] for table in schema.get("tables", [])
-            ]
+            if "selected_tables" not in restored_source or restored_source.get("selected_tables") is None:
+                restored_source["selected_tables"] = [
+                    table["name"] for table in schema.get("tables", [])
+                ]
         else:
             file_path = Path(str(restored_source.get("file_path") or ""))
             if not file_path.exists():
@@ -389,9 +390,10 @@ class ConnectorService:
                     display_file_name=restored_source.get("file_name"),
                 )
                 restored_source["schema_cache"] = schema
-                restored_source["selected_tables"] = restored_source.get("selected_tables") or [
-                    table["name"] for table in schema.get("tables", [])
-                ]
+                if "selected_tables" not in restored_source or restored_source.get("selected_tables") is None:
+                    restored_source["selected_tables"] = [
+                        table["name"] for table in schema.get("tables", [])
+                    ]
 
         await self.session_service.update_data_source(user_id, session_id, restored_source)
         return self._connected_source_result(restored_source)
@@ -534,6 +536,7 @@ class ConnectorService:
         return str(created["_id"])
 
     def _apply_context(self, schema: dict, data_source: dict | None) -> dict:
+        selection_is_explicit = bool(data_source is not None and "selected_tables" in data_source)
         selected_tables = set((data_source or {}).get("selected_tables", []))
         table_descriptions = (data_source or {}).get("table_descriptions", {})
         field_descriptions = (data_source or {}).get("field_descriptions", {})
@@ -553,7 +556,7 @@ class ConnectorService:
             tables.append(
                 {
                     **table,
-                    "selected": table_name in selected_tables if selected_tables else True,
+                    "selected": table_name in selected_tables if selection_is_explicit else True,
                     "description": table_descriptions.get(table_name),
                     "fields": table_fields,
                 }
@@ -802,11 +805,12 @@ class ConnectorService:
         row_limit: int = 100,
     ) -> dict[str, list[dict]]:
         schema = data_source.get("schema_cache", {})
-        selected = set(data_source.get("selected_tables", []))
+        selected = {str(name) for name in data_source.get("selected_tables", []) if name}
+        selection_is_explicit = "selected_tables" in data_source
         table_names = [
             str(table.get("name"))
             for table in schema.get("tables", [])
-            if table.get("name") and (not selected or table.get("name") in selected)
+            if table.get("name") and (not selection_is_explicit or table.get("name") in selected)
         ][:max_tables]
 
         samples: dict[str, list[dict]] = {}
@@ -985,9 +989,10 @@ class ConnectorService:
             if table.get("name")
         }
         selected = {str(name) for name in data_source.get("selected_tables", []) if name}
+        selection_is_explicit = "selected_tables" in data_source
         if known and collection_name not in known:
             raise ValueError(f"MongoDB collection '{collection_name}' is not present in the connected schema.")
-        if selected and collection_name not in selected:
+        if selection_is_explicit and collection_name not in selected:
             raise ValueError(f"MongoDB collection '{collection_name}' is not selected for analysis.")
 
     def _sanitize_mongodb_stage(self, stage_operator: str, value: Any) -> Any:
@@ -1248,6 +1253,8 @@ class ConnectorService:
 
     def _infer_mongodb_collection(self, data_source: dict) -> str | None:
         selected = [str(name) for name in data_source.get("selected_tables", []) if name]
+        if "selected_tables" in data_source and not selected:
+            return None
         if len(selected) == 1:
             return selected[0]
 

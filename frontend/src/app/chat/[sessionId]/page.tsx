@@ -793,7 +793,7 @@ export default function ChatSessionPage() {
                     title={reportTitle}
                   >
                     <FileText size={16} />
-                    {reportLoading ? "Creating PDF" : "Generate report"}
+                    {reportLoading ? "Generating..." : "Generate report"}
                   </button>
                   {!sourceConfigured ? (
                     <button type="button" className="status-pill warning" onClick={() => { setConnectorModalMode("all"); setIsModalOpen(true); }}>
@@ -803,6 +803,18 @@ export default function ChatSessionPage() {
                   ) : null}
                 </div>
               </header>
+
+              {reportLoading ? (
+                <div className="report-generation-overlay" role="status" aria-live="polite">
+                  <div className="report-generation-panel">
+                    <span className="report-generation-spinner" aria-hidden="true" />
+                    <div>
+                      <strong>Generating report</strong>
+                      <span>Building your PDF from the saved chat.</span>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
 
               <div className="chat-body">
                 <div className="chat-body-inner">

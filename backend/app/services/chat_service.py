@@ -168,6 +168,17 @@ class ChatService:
                 yield event
             return
 
+        if self._is_destructive_data_request(question):
+            async for event in self._stream_prebuilt_reply(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=self._destructive_data_request_reply(data_source),
+                intent_type="conversation",
+            ):
+                yield event
+            return
+
         if not data_source:
             async for event in self._stream_general_chat_reply(
                 user_id=user_id,
@@ -175,6 +186,17 @@ class ChatService:
                 question=question,
                 provider_preference=provider_preference,
                 data_source=None,
+            ):
+                yield event
+            return
+
+        if not self._has_selected_tables_for_chat(data_source) and not self._is_data_source_question(question):
+            async for event in self._stream_prebuilt_reply(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=self._no_selected_tables_reply(data_source),
+                intent_type="conversation",
             ):
                 yield event
             return
@@ -526,6 +548,21 @@ class ChatService:
                 "provider_used": None,
             }
 
+        if self._is_destructive_data_request(question):
+            message = self._destructive_data_request_reply(data_source)
+            await self._append_turn(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=message,
+                intent_type="conversation",
+            )
+            return {
+                "message": message,
+                "viz_data": None,
+                "provider_used": None,
+            }
+
         if not data_source:
             message, provider_used = await self._build_general_chat_reply(
                 user_id=user_id,
@@ -545,6 +582,21 @@ class ChatService:
                 "message": message,
                 "viz_data": None,
                 "provider_used": provider_used,
+            }
+
+        if not self._has_selected_tables_for_chat(data_source) and not self._is_data_source_question(question):
+            message = self._no_selected_tables_reply(data_source)
+            await self._append_turn(
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                message=message,
+                intent_type="conversation",
+            )
+            return {
+                "message": message,
+                "viz_data": None,
+                "provider_used": None,
             }
 
         chat_intent = await self._classify_chat_intent(
@@ -679,6 +731,60 @@ class ChatService:
             data_source,
             include_columns=self._is_column_request(question) or bool(requested_tables),
             requested_tables=requested_tables,
+        )
+
+    def _is_destructive_data_request(self, question: str) -> bool:
+        normalized = question.lower().translate(str.maketrans("", "", string.punctuation))
+        words = set(normalized.split())
+        destructive_words = {"delete", "remove", "erase", "clear", "drop", "truncate", "destroy", "disconnect"}
+        data_words = {
+            "data",
+            "dataset",
+            "database",
+            "source",
+            "table",
+            "tables",
+            "file",
+            "csv",
+            "rows",
+            "records",
+            "connection",
+        }
+        return bool(words.intersection(destructive_words) and words.intersection(data_words))
+
+    def _destructive_data_request_reply(self, data_source: dict | None) -> str:
+        if not data_source:
+            return (
+                "There is no connected data source in this chat, so there is nothing for me to delete. "
+                "Your data is unchanged. If you meant this conversation, delete it from the sidebar. "
+                "If you meant a connected source, use the Disconnect control when a source is attached."
+            )
+
+        return (
+            "I cannot delete or mutate your underlying data from chat, and nothing has been changed. "
+            "Use the Disconnect control to detach the current source from this session, or delete the chat "
+            "from the sidebar if you want to remove the conversation."
+        )
+
+    def _selection_is_explicit(self, data_source: dict) -> bool:
+        return "selected_tables" in data_source
+
+    def _selected_tables_for_chat(self, data_source: dict) -> set[str] | None:
+        if not self._selection_is_explicit(data_source):
+            return None
+        return {str(name).strip() for name in data_source.get("selected_tables", []) if str(name).strip()}
+
+    def _has_selected_tables_for_chat(self, data_source: dict) -> bool:
+        selected = self._selected_tables_for_chat(data_source)
+        return True if selected is None else bool(selected)
+
+    def _no_selected_tables_reply(self, data_source: dict) -> str:
+        source_label = self._source_label(data_source)
+        table_label = self._table_label(data_source["type"], plural=True)
+        return (
+            f"{source_label} is connected, but no {table_label} are selected for chat. "
+            "I will not analyze or infer from unselected tables. Open Data preview, select at least one table, "
+            "and save bot guidance before asking data questions."
         )
 
     async def _history_reply(
@@ -1340,18 +1446,20 @@ class ChatService:
         requested_tables: set[str] | None = None,
     ) -> str:
         schema = data_source.get("schema_cache", {})
-        selected = set(data_source.get("selected_tables", []))
+        selected = self._selected_tables_for_chat(data_source)
+        selection_is_explicit = selected is not None
+        selected = selected or set()
         all_tables = schema.get("tables", [])
         requested_tables = requested_tables or set()
         if requested_tables:
             visible_tables = [
                 table
                 for table in all_tables
-                if table.get("name") in requested_tables and (not selected or table.get("name") in selected)
+                if table.get("name") in requested_tables and (not selection_is_explicit or table.get("name") in selected)
             ]
         else:
-            visible_tables = [table for table in all_tables if not selected or table.get("name") in selected]
-        hidden_tables = [table for table in all_tables if selected and table.get("name") not in selected]
+            visible_tables = [table for table in all_tables if not selection_is_explicit or table.get("name") in selected]
+        hidden_tables = [table for table in all_tables if selection_is_explicit and table.get("name") not in selected]
 
         source_label = self._source_label(data_source)
         table_label = self._table_label(data_source["type"], plural=True)
@@ -1979,11 +2087,13 @@ class ChatService:
             return "No data source is connected."
 
         schema = data_source.get("schema_cache", {})
-        selected = set(data_source.get("selected_tables", []))
+        selected = self._selected_tables_for_chat(data_source)
+        selection_is_explicit = selected is not None
+        selected = selected or set()
         tables = [
             table
             for table in schema.get("tables", [])
-            if table.get("name") and (not selected or table.get("name") in selected)
+            if table.get("name") and (not selection_is_explicit or table.get("name") in selected)
         ]
         table_lines = []
         for table in tables[:8]:
@@ -2170,10 +2280,12 @@ class ChatService:
         and suggests concrete questions so the user always gets a useful response.
         """
         schema = data_source.get("schema_cache", {})
-        selected = set(data_source.get("selected_tables", []))
+        selected = self._selected_tables_for_chat(data_source)
+        selection_is_explicit = selected is not None
+        selected = selected or set()
         tables = [
             t for t in schema.get("tables", [])
-            if not selected or t.get("name") in selected
+            if not selection_is_explicit or t.get("name") in selected
         ]
 
         lines = [
@@ -2500,7 +2612,9 @@ class ChatService:
 
     def _build_schema_context(self, data_source: dict, *, question: str | None = None) -> str:
         schema = data_source.get("schema_cache", {})
-        selected = set(data_source.get("selected_tables", []))
+        selected = self._selected_tables_for_chat(data_source)
+        selection_is_explicit = selected is not None
+        selected = selected or set()
         requested_tables = self._requested_table_names(question or "", data_source) if question else set()
         database_description = data_source.get("database_description") or ""
         lines = [f"Source type: {data_source['type']}"]
@@ -2510,12 +2624,15 @@ class ChatService:
             lines.append(f"File name: {data_source['file_name']}")
         if database_description:
             lines.append(f"Database description: {database_description}")
+        if selection_is_explicit and not selected:
+            lines.append("No tables are selected for chat.")
+            return self._truncate_text("\n".join(lines), MAX_PROMPT_CHARS)
 
         included_tables = 0
         skipped_tables = 0
         for table in schema.get("tables", []):
             table_name = table["name"]
-            if selected and table_name not in selected:
+            if selection_is_explicit and table_name not in selected:
                 continue
             if requested_tables and table_name not in requested_tables:
                 skipped_tables += 1
@@ -2909,7 +3026,10 @@ class ChatService:
         if requested:
             return sorted(requested)
 
-        selected = [str(name) for name in data_source.get("selected_tables", []) if name]
+        selected_set = self._selected_tables_for_chat(data_source)
+        if selected_set is not None and not selected_set:
+            return []
+        selected = sorted(selected_set) if selected_set is not None else []
         if len(selected) == 1:
             return selected
 
@@ -3186,8 +3306,10 @@ class ChatService:
         data_source: dict,
     ) -> str | None:
         tables = self._schema_tables_by_name(data_source)
-        selected = {str(name) for name in data_source.get("selected_tables", []) if name}
-        candidates = [name for name in tables if not selected or name in selected]
+        selected = self._selected_tables_for_chat(data_source)
+        selection_is_explicit = selected is not None
+        selected = selected or set()
+        candidates = [name for name in tables if not selection_is_explicit or name in selected]
         if not candidates:
             return None
 
@@ -3240,8 +3362,8 @@ class ChatService:
         q_norm = self._normalize_lookup_text(question)
         best: tuple[int, str, list[str]] | None = None
         for table_name, table in self._schema_tables_by_name(data_source).items():
-            selected = set(data_source.get("selected_tables", []))
-            if selected and table_name not in selected:
+            selected = self._selected_tables_for_chat(data_source)
+            if selected is not None and table_name not in selected:
                 continue
             fields = [str(field.get("name")) for field in table.get("fields", []) if field.get("name")]
             dimensions = [
@@ -3294,9 +3416,9 @@ class ChatService:
             return None
 
         best: tuple[int, str, str, str] | None = None
-        selected = set(data_source.get("selected_tables", []))
+        selected = self._selected_tables_for_chat(data_source)
         for table_name in self._schema_tables_by_name(data_source):
-            if selected and table_name not in selected:
+            if selected is not None and table_name not in selected:
                 continue
             fields = self._schema_field_names(data_source, table_name)
             lower_fields = {field.lower(): field for field in fields}
@@ -3397,7 +3519,7 @@ class ChatService:
         """Validate the LLM-generated query plan against the known schema. Returns warnings."""
         warnings: list[str] = []
         schema = data_source.get("schema_cache", {})
-        selected = set(data_source.get("selected_tables", []))
+        selected = self._selected_tables_for_chat(data_source)
         known_tables = {str(t["name"]) for t in schema.get("tables", []) if t.get("name")}
         known_fields: dict[str, set[str]] = {}
         for t in schema.get("tables", []):
@@ -3410,7 +3532,7 @@ class ChatService:
                 warnings.append("MongoDB analysis plan is missing a collection.")
             elif collection not in known_tables:
                 warnings.append(f"Collection '{collection}' not found in schema.")
-            if selected and collection and collection not in selected:
+            if selected is not None and collection and collection not in selected:
                 warnings.append(f"Collection '{collection}' is not in selected tables.")
             # Check field references in pipeline
             pipeline = query_plan.get("pipeline", [])
