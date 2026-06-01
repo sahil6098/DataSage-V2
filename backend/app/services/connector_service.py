@@ -4,6 +4,7 @@ import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -13,6 +14,7 @@ from pymongo import MongoClient
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Engine
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -43,6 +45,23 @@ class ConnectorService:
         self.session_service = SessionService()
         self.settings = get_settings()
         self.quality_service = QualityService()
+        self._postgres_engines: dict[str, Engine] = {}
+
+    def _get_postgres_engine(self, connection_uri: str) -> Engine:
+        engine = self._postgres_engines.get(connection_uri)
+        if engine is None:
+            engine = create_engine(
+                connection_uri,
+                connect_args={"connect_timeout": 6},
+                pool_size=2,
+                max_overflow=1,
+                pool_recycle=1800,
+            )
+            self._postgres_engines[connection_uri] = engine
+        return engine
+
+    def _quote_postgres_identifier(self, identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
 
     async def list_saved_sources(self, user_id: str) -> list[SavedSourceOut]:
         cursor = self.db.saved_sources.find({"user_id": user_id}).sort("updated_at", -1)
@@ -199,37 +218,105 @@ class ConnectorService:
 
     async def import_google_sheet(self, user_id: str, session_id: str, sheet_url: str) -> dict:
         """Download a public Google Sheet as CSV and process it identically to a file upload."""
+        sheet_id, gid = self._parse_google_sheet_url(sheet_url)
+        content = await self._download_public_google_sheet_csv(sheet_id, gid)
+        file_name = f"google_sheet_{sheet_id[:12]}.csv"
+        return await self.upload_file(user_id, session_id, file_name, content)
+
+    def _parse_google_sheet_url(self, sheet_url: str) -> tuple[str, str | None]:
         match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", sheet_url)
         if not match:
             raise ValueError(
                 "Invalid Google Sheets URL. Copy the full URL from your browser address bar."
             )
         sheet_id = match.group(1)
-        gid_match = re.search(r"gid=(\d+)", sheet_url)
-        gid = gid_match.group(1) if gid_match else "0"
-        export_url = (
-            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
-            f"?format=csv&gid={gid}"
-        )
+        parsed = urlparse(sheet_url)
+        query_gid = parse_qs(parsed.query).get("gid", [None])[0]
+        fragment_gid = parse_qs(parsed.fragment).get("gid", [None])[0]
+        gid = query_gid or fragment_gid
+        return sheet_id, gid if gid and gid.isdigit() else None
+
+    async def _download_public_google_sheet_csv(self, sheet_id: str, gid: str | None) -> bytes:
+        blocked = False
+        last_status: int | None = None
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            try:
-                response = await client.get(export_url)
-                if response.status_code in {400, 401, 403}:
-                    raise ValueError(
-                        "The Google Sheet is not publicly accessible. "
-                        "Open the sheet in Google Sheets, click Share → General access → "
-                        "'Anyone with the link' → Viewer, then try again."
-                    )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise ValueError(
-                    f"Failed to download Google Sheet (HTTP {exc.response.status_code}). "
-                    "Ensure the sheet is shared publicly and the URL is copied from your browser address bar."
-                ) from exc
-            except httpx.RequestError as exc:
-                raise ValueError(f"Network error downloading Google Sheet: {exc}") from exc
-        file_name = f"google_sheet_{sheet_id[:12]}.csv"
-        return await self.upload_file(user_id, session_id, file_name, response.content)
+            for export_url in self._google_sheet_csv_export_urls(sheet_id, gid):
+                try:
+                    response = await client.get(export_url)
+                except httpx.RequestError as exc:
+                    raise ValueError(f"Network error downloading Google Sheet: {exc}") from exc
+
+                last_status = response.status_code
+                if response.status_code in {401, 403}:
+                    blocked = True
+                    continue
+                if response.status_code == 400:
+                    continue
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    continue
+
+                if self._is_google_sheet_csv_response(response):
+                    return response.content
+                if self._is_google_access_page(response):
+                    blocked = True
+
+        if blocked:
+            raise ValueError(self._google_sheet_public_access_message())
+
+        if last_status == 400 and gid:
+            raise ValueError(
+                "Could not export the selected Google Sheet tab. "
+                "Open the exact tab you want to import, copy the URL again, and try once more."
+            )
+        raise ValueError(
+            f"Failed to download Google Sheet (HTTP {last_status or 'unknown'}). "
+            "Ensure the sheet is shared publicly and the URL is copied from your browser address bar."
+        )
+
+    def _google_sheet_csv_export_urls(self, sheet_id: str, gid: str | None) -> list[str]:
+        base = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        if gid:
+            return [
+                f"{base}/export?format=csv&gid={gid}",
+                f"{base}/gviz/tq?tqx=out:csv&gid={gid}",
+            ]
+        return [
+            f"{base}/export?format=csv",
+            f"{base}/gviz/tq?tqx=out:csv",
+            f"{base}/export?format=csv&gid=0",
+            f"{base}/gviz/tq?tqx=out:csv&gid=0",
+        ]
+
+    def _is_google_sheet_csv_response(self, response: httpx.Response) -> bool:
+        content = response.content.lstrip()
+        if not content:
+            return False
+        content_type = response.headers.get("content-type", "").lower()
+        if content[:200].lower().startswith((b"<!doctype html", b"<html")):
+            return False
+        return "text/html" not in content_type
+
+    def _is_google_access_page(self, response: httpx.Response) -> bool:
+        page_text = response.text[:4000].lower()
+        return any(
+            marker in page_text
+            for marker in (
+                "servicelogin",
+                "sign in",
+                "request access",
+                "you need access",
+                "access denied",
+            )
+        )
+
+    def _google_sheet_public_access_message(self) -> str:
+        return (
+            "The Google Sheet is not publicly accessible. "
+            "Open the sheet in Google Sheets, click Share > General access > "
+            "'Anyone with the link' > Viewer, then try again."
+        )
 
     async def _compute_file_quality_async(self, file_path: Path, schema: dict) -> dict:
         """Load sample rows from each table and compute quality reports."""
@@ -317,6 +404,14 @@ class ConnectorService:
         cached_schema = data_source.get("schema_cache")
         if cached_schema and cached_schema.get("tables"):
             schema = self._apply_context(copy.deepcopy(cached_schema), data_source)
+            if data_source.get("type") == "postgresql" and data_source.get("connection_uri_encrypted"):
+                schema = await self._refresh_postgres_schema_row_counts(
+                    schema,
+                    decrypt_text(data_source["connection_uri_encrypted"]),
+                )
+                data_source["schema_cache"] = schema
+                data_source["updated_at"] = ist_now()
+                await self.session_service.update_data_source(user_id, session_id, data_source)
             if schema.get("database_name") and data_source.get("saved_source_id"):
                 await self.db.saved_sources.update_one(
                     {"_id": ObjectId(data_source["saved_source_id"])},
@@ -563,34 +658,46 @@ class ConnectorService:
         field_descriptions = (data_source or {}).get("field_descriptions", {})
 
         def _read():
-            engine = create_engine(connection_uri, pool_pre_ping=True)
+            engine = self._get_postgres_engine(connection_uri)
             try:
-                inspector = inspect(engine)
                 tables = []
-                for table_name in inspector.get_table_names(schema="public"):
-                    columns = inspector.get_columns(table_name, schema="public")
-                    fields = []
-                    for column in columns:
-                        column_name = str(column["name"])
-                        fields.append(
+                with engine.connect() as connection:
+                    inspector = inspect(connection)
+
+                    for table_name in inspector.get_table_names(schema="public"):
+                        columns = inspector.get_columns(table_name, schema="public")
+                        fields = []
+                        for column in columns:
+                            column_name = str(column["name"])
+                            fields.append(
+                                {
+                                    "name": column_name,
+                                    "type": str(column.get("type")),
+                                    "nullable": bool(column.get("nullable", True)),
+                                    "samples": [],
+                                    "description": field_descriptions.get(table_name, {}).get(column_name),
+                                }
+                            )
+                        quoted_table = self._quote_postgres_identifier(table_name)
+                        row_count = connection.execute(
+                            text(f"SELECT COUNT(*) FROM public.{quoted_table}")
+                        ).scalar() or 0
+                        sample_rows = connection.execute(
+                            text(f"SELECT * FROM public.{quoted_table} LIMIT 3")
+                        ).mappings().all()
+                        for field in fields:
+                            field["samples"] = [
+                                str(normalize_value(row.get(field["name"])))
+                                for row in sample_rows
+                                if row.get(field["name"]) is not None
+                            ][:3]
+                        tables.append(
                             {
-                                "name": column_name,
-                                "type": str(column.get("type")),
-                                "nullable": bool(column.get("nullable", True)),
-                                "samples": [],
-                                "description": field_descriptions.get(table_name, {}).get(column_name),
+                                "name": table_name,
+                                "row_count": int(row_count),
+                                "fields": fields,
                             }
                         )
-                    with engine.connect() as connection:
-                        row_count = connection.execute(text(f'SELECT COUNT(*) FROM public."{table_name}"')).scalar() or 0
-                        sample_rows = connection.execute(text(f'SELECT * FROM public."{table_name}" LIMIT 3')).mappings().all()
-                    for field in fields:
-                        field["samples"] = [
-                            str(normalize_value(row.get(field["name"])))
-                            for row in sample_rows
-                            if row.get(field["name"]) is not None
-                        ][:3]
-                    tables.append({"name": table_name, "row_count": int(row_count), "fields": fields})
 
                 return {
                     "source_type": "postgresql",
@@ -600,12 +707,35 @@ class ConnectorService:
                     "tables": tables,
                 }
             finally:
-                engine.dispose()
+                pass
 
         try:
             return await asyncio.to_thread(_read)
         except PyMongoError as exc:
             raise ValueError(self._mongodb_error_message(exc)) from exc
+
+    async def _refresh_postgres_schema_row_counts(self, schema: dict, connection_uri: str) -> dict:
+        def _read_counts() -> dict[str, int]:
+            engine = self._get_postgres_engine(connection_uri)
+            counts: dict[str, int] = {}
+            with engine.connect() as connection:
+                for table in schema.get("tables", []):
+                    table_name = str(table.get("name") or "").strip()
+                    if not table_name:
+                        continue
+                    quoted_table = self._quote_postgres_identifier(table_name)
+                    row_count = connection.execute(
+                        text(f"SELECT COUNT(*) FROM public.{quoted_table}")
+                    ).scalar() or 0
+                    counts[table_name] = int(row_count)
+            return counts
+
+        counts = await asyncio.to_thread(_read_counts)
+        for table in schema.get("tables", []):
+            table_name = str(table.get("name") or "").strip()
+            if table_name in counts:
+                table["row_count"] = counts[table_name]
+        return schema
 
     async def _fetch_file_rows(
         self,
@@ -642,14 +772,14 @@ class ConnectorService:
 
     async def _fetch_postgres_rows(self, connection_uri: str, table_name: str, limit: int) -> list[dict]:
         def _read():
-            engine = create_engine(connection_uri, pool_pre_ping=True)
+            engine = self._get_postgres_engine(connection_uri)
             try:
-                query = text(f'SELECT * FROM public."{table_name}" LIMIT :limit')
+                query = text(f"SELECT * FROM public.{self._quote_postgres_identifier(table_name)} LIMIT :limit")
                 with engine.connect() as connection:
                     rows = connection.execute(query, {"limit": limit}).mappings().all()
                 return [{key: normalize_value(value) for key, value in row.items()} for row in rows]
             finally:
-                engine.dispose()
+                pass
 
         return await asyncio.to_thread(_read)
 
@@ -705,13 +835,13 @@ class ConnectorService:
         connection_uri = decrypt_text(data_source["connection_uri_encrypted"])
 
         def _run():
-            engine = create_engine(connection_uri, pool_pre_ping=True)
+            engine = self._get_postgres_engine(connection_uri)
             try:
                 with engine.connect() as connection:
-                    rows = connection.execute(text(query)).mappings().all()
-                return [{key: normalize_value(value) for key, value in row.items()} for row in rows[:row_limit]]
+                    rows = connection.execute(text(query)).mappings().fetchmany(row_limit)
+                return [{key: normalize_value(value) for key, value in row.items()} for row in rows]
             finally:
-                engine.dispose()
+                pass
 
         return await asyncio.to_thread(_run)
 

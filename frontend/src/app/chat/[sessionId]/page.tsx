@@ -309,7 +309,7 @@ export default function ChatSessionPage() {
     }
   };
 
-  const sendMessage = async (messageText?: string) => {
+  const sendMessage = async (messageText?: string, options?: { hideFollowUp?: string }) => {
     const content = (messageText ?? input).trim();
     if (!content) {
       return;
@@ -319,7 +319,13 @@ export default function ChatSessionPage() {
       return;
     }
 
-    const optimisticMessages = [...messages, { role: "user", content }];
+    const baseMessages = options?.hideFollowUp
+      ? messages.map((message) => ({
+        ...message,
+        follow_ups: message.follow_ups?.filter((suggestion) => suggestion !== options.hideFollowUp),
+      }))
+      : messages;
+    const optimisticMessages = [...baseMessages, { role: "user", content }];
     setMessages(optimisticMessages);
     if (!messageText) {
       setInput("");
@@ -819,7 +825,7 @@ export default function ChatSessionPage() {
                           key={`${message.role}-${index}`}
                           message={message}
                           userDisplayName={getUserDisplayName(currentUser)}
-                          onFollowUpClick={(text) => { void sendMessage(text); }}
+                          onFollowUpClick={(text) => { void sendMessage(text, { hideFollowUp: text }); }}
                         />
                       ))}
                     </div>

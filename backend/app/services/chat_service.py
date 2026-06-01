@@ -13,7 +13,6 @@ from app.schemas.chat import AnalysisAnswerPayload, ChatIntent, MongoAnalysisPla
 from app.services.anomaly_service import AnomalyService
 from app.services.connector_service import ConnectorService
 from app.services.forecast_service import ForecastService
-from app.services.history_service import HistoryService
 from app.services.llm_service import LlmService
 from app.services.memory_service import SessionMemoryService
 from app.services.session_service import SessionService
@@ -32,7 +31,7 @@ MAX_PROMPT_FIELDS_PER_ROW = 12
 MAX_PROMPT_VALUE_CHARS = 200
 MAX_MEMORY_CONTEXT_CHARS = 3_000
 MAX_QUERY_RETRIES = 2
-MAX_PLAN_VALIDATION_RETRIES = 1
+MAX_PLAN_VALIDATION_RETRIES = 0
 
 SQL_KEYWORDS = {
     # ── Standard SQL clauses & operators ──
@@ -137,7 +136,6 @@ class ChatService:
         self.query_cache = QueryPlanCache()
         self.anomaly_service = AnomalyService()
         self.forecast_service = ForecastService()
-        self.history_service = HistoryService()
         self.graph = self._build_graph()
 
     async def process_message_stream(
@@ -199,7 +197,7 @@ class ChatService:
 
         data_source_reply = self._data_source_reply(question, data_source)
         if data_source_reply or chat_intent == "source_overview":
-            data_source_reply = data_source_reply or self._describe_data_source(
+            schema_reply = data_source_reply or self._describe_data_source(
                 data_source,
                 include_columns=True,
             )
@@ -209,16 +207,17 @@ class ChatService:
                     session_id=session_id,
                     question=question,
                     data_source=data_source,
-                    schema_reply=data_source_reply,
+                    schema_reply=schema_reply,
                     provider_preference=provider_preference,
                 ):
                     yield event
             else:
-                async for event in self._stream_prebuilt_reply(
+                async for event in self._stream_source_schema_reply(
                     user_id=user_id,
                     session_id=session_id,
                     question=question,
-                    message=data_source_reply,
+                    schema_reply=schema_reply,
+                    provider_preference=provider_preference,
                 ):
                     yield event
             return
@@ -464,15 +463,6 @@ class ChatService:
             tables_used=_tables_used or None,
             intent_type="analytical",
         )
-        # Save to query history (fire-and-forget, non-blocking)
-        asyncio.ensure_future(
-            self._save_history_safe(
-                user_id=user_id,
-                session_id=session_id,
-                question=question,
-                answer_preview=message,
-            )
-        )
         # Stamp last_used_at on the data source
         asyncio.ensure_future(
             self.session_service.touch_data_source_last_used(user_id, session_id)
@@ -585,7 +575,7 @@ class ChatService:
 
         data_source_reply = self._data_source_reply(question, data_source)
         if data_source_reply or chat_intent == "source_overview":
-            data_source_reply = data_source_reply or self._describe_data_source(
+            schema_reply = data_source_reply or self._describe_data_source(
                 data_source,
                 include_columns=True,
             )
@@ -593,7 +583,7 @@ class ChatService:
                 message, provider_used = await self._build_data_source_overview(
                     question=question,
                     data_source=data_source,
-                    schema_reply=data_source_reply,
+                    schema_reply=schema_reply,
                     provider_preference=provider_preference,
                 )
                 await self._append_turn(
@@ -608,16 +598,21 @@ class ChatService:
                     "provider_used": provider_used,
                 }
 
+            message, provider_used = await self._build_source_schema_reply(
+                question=question,
+                schema_reply=schema_reply,
+                provider_preference=provider_preference,
+            )
             await self._append_turn(
                 user_id=user_id,
                 session_id=session_id,
                 question=question,
-                message=data_source_reply,
+                message=message,
             )
             return {
-                "message": data_source_reply,
+                "message": message,
                 "viz_data": None,
-                "provider_used": None,
+                "provider_used": provider_used,
             }
 
         schema_context = self._build_schema_context(data_source, question=question)
@@ -694,11 +689,11 @@ class ChatService:
         question: str,
         provider_preference: str | None = None,
     ) -> str | None:
-        messages = await self.session_service.get_messages(user_id, session_id)
-        if not messages:
+        if not self._should_answer_from_session_memory(question):
             return None
 
-        if not self._should_answer_from_session_memory(question):
+        messages = await self.session_service.get_messages(user_id, session_id)
+        if not messages:
             return None
 
         llm_reply = await self._llm_session_memory_reply(
@@ -1468,6 +1463,62 @@ class ChatService:
         )
         yield {"type": "final", "payload": {"message": message, "viz_data": None, "provider_used": provider_used}}
 
+    async def _stream_source_schema_reply(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        question: str,
+        schema_reply: str,
+        provider_preference: str | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        yield self._stage_event("generating", "Reading schema")
+        provider_used = None
+        chunks: list[str] = []
+        try:
+            async for provider, chunk in self.llm_service.stream_text(
+                system_prompt=self._source_schema_prompt(),
+                user_prompt=self._source_schema_user_prompt(question=question, schema_reply=schema_reply),
+                preferred_provider=provider_preference,
+                max_output_tokens=420,
+            ):
+                if not provider_used:
+                    provider_used = provider
+                chunks.append(chunk)
+                yield {"type": "chunk", "content": chunk}
+        except ValueError:
+            chunks = [schema_reply]
+            for chunk in self._split_stream_text(schema_reply):
+                yield {"type": "chunk", "content": chunk}
+                await asyncio.sleep(0.02)
+
+        message = "".join(chunks).strip() or schema_reply
+        await self._append_turn(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            message=message,
+        )
+        yield {"type": "final", "payload": {"message": message, "viz_data": None, "provider_used": provider_used}}
+
+    async def _build_source_schema_reply(
+        self,
+        *,
+        question: str,
+        schema_reply: str,
+        provider_preference: str | None,
+    ) -> tuple[str, str | None]:
+        try:
+            answer, provider = await self.llm_service.invoke_text(
+                system_prompt=self._source_schema_prompt(),
+                user_prompt=self._source_schema_user_prompt(question=question, schema_reply=schema_reply),
+                preferred_provider=provider_preference,
+                max_output_tokens=420,
+            )
+            return answer.strip() or schema_reply, provider
+        except ValueError:
+            return schema_reply, None
+
     async def _build_data_source_overview(
         self,
         *,
@@ -1493,6 +1544,19 @@ class ChatService:
         if self._is_incomplete_overview(insight):
             return f"{schema_reply.rstrip()}\n\n{self._fallback_profile_analysis(profile)}".strip(), provider
         return f"{schema_reply.rstrip()}\n\n{insight.strip()}".strip(), provider
+
+    def _source_schema_prompt(self) -> str:
+        return (
+            "You are DataSage answering questions about the user's connected data source. "
+            "Use only the provided schema summary and saved bot guidance. "
+            "Answer the user's schema, table, column, or source question directly and naturally. "
+            "Do not invent tables, fields, sample values, row counts, or relationships that are not in the summary. "
+            "If the user asks for analysis or trends that require reading rows, say what you can infer from the schema "
+            "and suggest a concrete analysis question they can ask next."
+        )
+
+    def _source_schema_user_prompt(self, *, question: str, schema_reply: str) -> str:
+        return f"User question:\n{question}\n\nConnected source schema summary:\n{schema_reply}"
 
     async def _sample_data_profile(self, data_source: dict) -> list[dict]:
         selected_count = len(data_source.get("selected_tables", []))
@@ -1801,6 +1865,10 @@ class ChatService:
         data_source: dict,
         provider_preference: str | None,
     ) -> str:
+        local_intent = self._classify_chat_intent_locally(question, data_source)
+        if local_intent:
+            return local_intent
+
         try:
             payload, _ = await self.llm_service.invoke_json(
                 system_prompt=self._chat_intent_prompt(),
@@ -1818,6 +1886,43 @@ class ChatService:
         except Exception as exc:
             logger.warning("Chat intent classification failed; defaulting to analysis: %s", exc)
         return "analysis"
+
+    def _classify_chat_intent_locally(self, question: str, data_source: dict) -> str | None:
+        normalized = question.lower().translate(str.maketrans("", "", string.punctuation))
+        normalized = " ".join(normalized.split())
+        words = set(normalized.split())
+
+        if self._is_data_source_question(question):
+            return "source_overview"
+
+        if self._user_requested_visualization(question):
+            return "analysis"
+
+        analysis_words = {
+            "analyze", "analyse", "analysis", "calculate", "count", "sum", "total", "average", "avg",
+            "median", "min", "max", "top", "bottom", "highest", "lowest", "rank", "compare",
+            "trend", "trends", "forecast", "predict", "distribution", "breakdown", "filter",
+            "where", "group", "segment", "rows", "records", "chart", "graph", "plot", "dashboard",
+            "anomaly", "anomalies", "outlier", "insight", "insights",
+        }
+        source_words = {"data", "dataset", "database", "table", "tables", "column", "columns", "field", "fields"}
+        follow_up_words = {"it", "this", "that", "them", "same", "again", "also", "now", "visual", "visually"}
+
+        if words.intersection(analysis_words | source_words):
+            return "analysis"
+
+        if words.intersection(follow_up_words) and self._has_prior_analysis_context(data_source):
+            return "analysis"
+
+        greeting_words = {"hi", "hello", "hey", "thanks", "thank", "okay", "ok", "cool"}
+        if words and words.issubset(greeting_words):
+            return "conversation"
+
+        return None
+
+    def _has_prior_analysis_context(self, data_source: dict) -> bool:
+        schema = data_source.get("schema_cache", {})
+        return bool(schema.get("tables"))
 
     def _chat_intent_prompt(self) -> str:
         return (
@@ -2696,7 +2801,7 @@ class ChatService:
         normalized = question.lower()
         # Primary: explicit visualization keywords
         if re.search(
-            r"\b(chart|graph|plot|visuali[sz](?:e|ed|ing|ation)|visualized|visualised|"
+            r"\b(chart|graph|plot|visuali[sz](?:e|ed|ing|ation)|visualized|visualised|visually|"
             r"dashboard|"
             r"bar chart|line chart|pie chart|donut chart|scatter|scatter plot|"
             r"histogram|heatmap|trend chart|gauge)\b",
@@ -2705,10 +2810,12 @@ class ChatService:
             return True
         # Secondary: natural follow-up phrasings
         followup_viz_patterns = (
-            r"\b(show|display|give|make|create|draw|render|put).{0,45}\b(chart|graph|plot|visual(?:ized|ised)?|diagram)\b",
-            r"\b(as a|in a|as an|into a).{0,20}\b(chart|graph|plot|bar|line|pie|donut|visual(?:ized|ised)?)\b",
+            r"\b(show|display|give|make|create|draw|render|put).{0,45}\b(chart|graph|plot|visual(?:ly|ized|ised)?|diagram)\b",
+            r"\b(as a|in a|as an|into a).{0,20}\b(chart|graph|plot|bar|line|pie|donut|visual(?:ly|ized|ised)?)\b",
             r"\b(can you|could you|please).{0,20}\b(chart|graph|plot|visuali[sz](?:e|ed|ing)|draw)\b",
             r"\b(show (it|this|that|them|the result|the data)).{0,20}\b(visually|graphically|as a chart|as a graph)\b",
+            r"\b(give|show|display|make|create).{0,30}\b(it|this|that|them|result|data)?\s*(visually|graphically)\b",
+            r"\b(visual|visualized|visualised|visual format|visual answer|visual view)\b",
             r"\bplot (it|this|that|them|the result|the data)\b",
             r"\bstructured\s+visuali[sz]ed\s+format\b",
         )
@@ -3592,9 +3699,15 @@ class ChatService:
 
         suggestions: list[str] = []
         seen: set[str] = set()
+        question_key = self._normalize_suggestion_text(question)
 
         def add(s: str) -> None:
             key = s.strip().lower()
+            normalized_key = self._normalize_suggestion_text(s)
+            if not normalized_key:
+                return
+            if normalized_key == question_key or normalized_key in question_key or question_key in normalized_key:
+                return
             if key not in seen:
                 seen.add(key)
                 suggestions.append(s.strip())
@@ -3704,22 +3817,9 @@ class ChatService:
 
         return suggestions[:3]
 
-
-    async def _save_history_safe(
-        self,
-        *,
-        user_id: str,
-        session_id: str,
-        question: str,
-        answer_preview: str,
-    ) -> None:
-        """Fire-and-forget wrapper around HistoryService.save_query."""
-        try:
-            await self.history_service.save_query(
-                user_id=user_id,
-                session_id=session_id,
-                question=question,
-                answer_preview=answer_preview,
-            )
-        except Exception as exc:
-            logger.warning("Query history save failed: %s", exc)
+    def _normalize_suggestion_text(self, value: str) -> str:
+        text = value.lower()
+        text = re.sub(r"[_\-.]+", " ", text)
+        text = text.translate(str.maketrans("", "", string.punctuation))
+        text = re.sub(r"\b(please|show|give|me|the|a|an)\b", " ", text)
+        return " ".join(text.split())

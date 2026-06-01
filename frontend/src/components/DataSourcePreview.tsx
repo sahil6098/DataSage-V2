@@ -1166,12 +1166,6 @@ export default function DataSourcePreview({
                   </span>
                 </div>
 
-                {schemaContextStatus ? (
-                  <div className={`schema-context-status ${schemaContextStatus.tone}`}>
-                    {schemaContextStatus.message}
-                  </div>
-                ) : null}
-
                 <div className="schema-context-block">
                   <label className="schema-context-label" htmlFor="database-description">
                     Database description
@@ -1272,14 +1266,21 @@ export default function DataSourcePreview({
                   <p className="helper-text">
                     These notes are added to the schema prompt so the assistant can answer with better context and fewer wrong assumptions.
                   </p>
-                  <button
-                    type="button"
-                    className="btn-primary schema-context-save"
-                    onClick={handleSaveSchemaContext}
-                    disabled={savingContext || !tables.length}
-                  >
-                    {savingContext ? "Saving..." : "Save bot guidance"}
-                  </button>
+                  <div className="schema-context-save-row">
+                    {schemaContextStatus ? (
+                      <div className={`schema-context-status ${schemaContextStatus.tone}`}>
+                        {schemaContextStatus.message}
+                      </div>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="btn-primary schema-context-save"
+                      onClick={handleSaveSchemaContext}
+                      disabled={savingContext || !tables.length}
+                    >
+                      {savingContext ? "Saving..." : "Save bot guidance"}
+                    </button>
+                  </div>
                 </div>
               </section>
 
