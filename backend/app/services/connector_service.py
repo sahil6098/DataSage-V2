@@ -618,7 +618,7 @@ class ConnectorService:
                         name
                         for name in client.list_database_names()
                         if name not in {"admin", "config", "local"}
-                    ]
+                    ]      
                 else:
                     available_databases = []
 
