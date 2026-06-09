@@ -35,8 +35,13 @@ app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
 # ── CORS must be the LAST middleware added so it runs FIRST ──────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # temporary wildcard — locks down after confirming fix
-    allow_credentials=False,      # must be False when allow_origins=["*"]
+    allow_origins=[
+        "https://frontend-one-azure-83.vercel.app",   # Vercel production
+        "https://frontend-hj4apz4tu-sahil-s-projects1309.vercel.app",  # Vercel preview
+        "http://localhost:3000",                       # local dev
+        "http://127.0.0.1:3000",                      # local dev alt
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
